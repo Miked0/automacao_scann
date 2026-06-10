@@ -1,94 +1,137 @@
-from __future__ import annotations
+"""Validações do MVP.
 
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Any, List
+Status possíveis por caso de teste:
+  OK             - tudo validado dentro da tolerância
+  ALERTA         - diferença dentro da tolerância (≤ 0,01)
+  REVISAR        - caso especial que exige análise humana
+  ERRO_PARSE     - falha ao parsear itens
+  ERRO_VALOR     - subtotal/desconto/total com problema aritmético ou não-numérico
+  ERRO_PAGAMENTO - forma de pagamento não mapeada
+"""
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, Optional
 
-from models import NumericField, TestCase, ValidationResult
 from parser_items import parse_itens
 from payments import normalize_pagamento
 
-TOLERANCIA = Decimal('0.01')
-TWOPLACES = Decimal('0.01')
+TOLERANCIA = Decimal("0.01")
+DECIMAL_PLACES = Decimal("0.01")
+
+# Palavras-chave que indicam caso especial -> REVISAR
+SPECIAL_KEYWORDS = [
+    "acrescimo",
+    "acréscimo",
+    "nao aplicada",
+    "não aplicada",
+    "promoção nao",
+    "promo nao",
+    "cancelamento",
+    "limite",
+    "bin",
+]
 
 
-def to_decimal_field(value: Any) -> NumericField:
-    if value is None:
-        return NumericField(raw=value, norm=None, error=True)
-    text = str(value).strip()
-    if text == '':
-        return NumericField(raw=value, norm=None, error=True)
+def _to_decimal(value: Any) -> Dict[str, Any]:
+    """Converte valor para Decimal com tratamento de ruído floating point."""
+    if value is None or str(value).strip() in ("", "nan", "None"):
+        return {"raw": None, "norm": None, "error": True}
     try:
-        cleaned = text.replace(',', '.')
-        raw = Decimal(cleaned)
-        norm = raw.quantize(TWOPLACES, rounding=ROUND_HALF_UP)
-        return NumericField(raw=value, norm=norm, error=False)
+        # converte via string para evitar ruído de float
+        raw = Decimal(str(value).replace(",", ".").strip())
+        norm = raw.quantize(DECIMAL_PLACES)
+        return {"raw": raw, "norm": norm, "error": False}
     except (InvalidOperation, ValueError):
-        return NumericField(raw=value, norm=None, error=True)
+        return {"raw": None, "norm": None, "error": True}
 
 
-def validate_test_case(test: TestCase) -> TestCase:
-    motivos: List[str] = []
+def _check_special_case(obs: Optional[str]) -> bool:
+    """Verifica se a observação indica caso especial que precisa de revisão manual."""
+    if not obs:
+        return False
+    obs_norm = obs.strip().lower()
+    return any(kw in obs_norm for kw in SPECIAL_KEYWORDS)
+
+
+def validate_test_case(test: Dict[str, Any]) -> Dict[str, Any]:
+    """Valida um caso de teste e retorna dict com status e campos normalizados."""
+    status = "OK"
+    motivo: List[str] = []
     alertas: List[str] = []
-    status = 'OK'
 
-    if not str(test.teste).strip():
-        status = 'ERRO_VALOR'
-        motivos.append('Teste sem identificador')
+    # 1. Identificador de teste
+    if not str(test.get("teste", "") or "").strip():
+        status = "ERRO_VALOR"
+        motivo.append("Teste sem identificador")
 
-    itens, item_alerts = parse_itens(test.itens_raw)
-    test.itens_parseados = itens
-    alertas.extend(item_alerts)
-    if test.itens_raw and not itens:
-        status = 'ERRO_PARSE'
-        motivos.append('Falha ao parsear itens')
+    # 2. Parse de itens
+    itens = parse_itens(test.get("itens_raw"))
+    itens_raw = test.get("itens_raw")
+    if itens_raw and not itens:
+        status = "ERRO_PARSE"
+        motivo.append("Falha ao parsear itens")
+    elif not itens_raw:
+        alertas.append("Campo itens_raw vazio")
 
-    test.pagamento_info = normalize_pagamento(test.pagamento_raw)
-    if test.pagamento_raw and test.pagamento_info.codigo_tipo_pago is None and not test.pagamento_info.is_multiplo:
-        status = 'ERRO_PAGAMENTO'
-        motivos.append('Pagamento não mapeado')
-    if test.pagamento_info.is_multiplo:
-        if status == 'OK':
-            status = 'REVISAR'
-        alertas.append('Pagamento com múltiplos meios requer revisão controlada')
+    # 3. Pagamento
+    pag = normalize_pagamento(test.get("pagamento_raw"))
+    if pag["codigo_tipo_pago"] is None and not pag["is_multiplo"]:
+        if pag["pagamento_normalizado"] is not None:
+            if status == "OK":
+                status = "ERRO_PAGAMENTO"
+            motivo.append(f"Pagamento não mapeado: {pag['pagamento_normalizado']}")
+        else:
+            alertas.append("Pagamento ausente")
 
-    test.subtotal = to_decimal_field(test.subtotal_raw)
-    test.desconto = to_decimal_field(test.desconto_raw)
-    test.total = to_decimal_field(test.total_raw)
+    # 4. Normalização numérica
+    sub = _to_decimal(test.get("subtotal_raw"))
+    dsc = _to_decimal(test.get("desconto_raw"))
+    tot = _to_decimal(test.get("total_raw"))
 
-    if test.subtotal.error:
-        status = 'ERRO_VALOR'
-        motivos.append('Subtotal não numérico')
-    if test.desconto.error:
-        status = 'ERRO_VALOR'
-        motivos.append('Desconto não numérico')
-    if test.total.error:
-        status = 'ERRO_VALOR'
-        motivos.append('Total não numérico')
+    if sub["error"]:
+        status = "ERRO_VALOR"
+        motivo.append("Subtotal não numérico")
+    if dsc["error"]:
+        # desconto pode ser 0 ou ausente em vendas normais
+        if test.get("desconto_raw") not in (None, "", "nan", "None", "0", "0.0", "0,0"):
+            status = "ERRO_VALOR"
+            motivo.append("Desconto não numérico")
+        else:
+            dsc = {"raw": Decimal("0"), "norm": Decimal("0.00"), "error": False}
+    if tot["error"]:
+        status = "ERRO_VALOR"
+        motivo.append("Total não numérico")
 
-    if not test.subtotal.error and not test.desconto.error and not test.total.error:
-        esperado = (test.subtotal.norm - test.desconto.norm).quantize(TWOPLACES, rounding=ROUND_HALF_UP)
-        diff = abs(esperado - test.total.norm)
+    # 5. Conferência aritmética: total = subtotal - desconto
+    if not any([sub["error"], dsc["error"], tot["error"]]):
+        esperado = sub["norm"] - dsc["norm"]
+        diff = (esperado - tot["norm"]).copy_abs()
         if diff > TOLERANCIA:
-            status = 'ERRO_VALOR'
-            motivos.append(f'Total não fecha com subtotal - desconto (dif {diff})')
-        elif diff > Decimal('0'):
-            if status == 'OK':
-                status = 'ALERTA'
-            alertas.append(f'Diferença de {diff} dentro da tolerância')
+            if status == "OK":
+                status = "ERRO_VALOR"
+            motivo.append(
+                f"Total não fecha: esperado={esperado}, informado={tot['norm']}, diferença={diff}"
+            )
+        elif diff > Decimal("0"):
+            if status == "OK":
+                status = "ALERTA"
+            alertas.append(f"Diferença de R$ {diff} dentro da tolerância de 0,01")
 
-    obs = str(test.observacoes_raw or '').lower()
-    if '0,01' in obs or '0.01' in obs:
-        alertas.append('Observação menciona tolerância de 0,01')
-    if 'ratead' in obs or 'rateio' in obs:
-        alertas.append('Observação indica desconto rateado')
-    if 'não aplicada' in obs or 'nao aplicada' in obs:
-        if status == 'OK':
-            status = 'REVISAR'
-        alertas.append('Observação indica promoção não aplicada')
+    # 6. Casos especiais -> REVISAR
+    if _check_special_case(test.get("observacoes_raw")):
+        if status == "OK":
+            status = "REVISAR"
+        alertas.append("Caso especial detectado na observação - requer análise humana")
 
-    test.validation = ValidationResult(
-        status_final=status,
-        motivo_status='; '.join(dict.fromkeys(motivos)) if motivos else None,
-        alertas=list(dict.fromkeys(alertas)),
-    )
-    return test
+    return {
+        "status_final": status,
+        "motivo_status": "; ".join(motivo) if motivo else None,
+        "alertas": "; ".join(alertas) if alertas else None,
+        "itens_parseados": str(itens) if itens else None,
+        "codigo_tipo_pago": pag["codigo_tipo_pago"],
+        "pagamento_normalizado": pag["pagamento_normalizado"],
+        "is_multiplo": pag["is_multiplo"],
+        "requires_bin": pag["requires_bin"],
+        "subtotal_norm": str(sub["norm"]) if not sub["error"] else None,
+        "desconto_norm": str(dsc["norm"]) if not dsc["error"] else None,
+        "total_norm": str(tot["norm"]) if not tot["error"] else None,
+    }

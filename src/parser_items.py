@@ -1,63 +1,70 @@
+"""Parser dos itens da venda.
+
+Transforma o campo itens_raw em lista estruturada.
+
+Formatos suportados:
+  - '3 x 7891000010860'          → qtd=3, ean
+  - '7891000010860'              → qtd=1, ean
+  - '3.579 x PESABLE'            → qtd=3.579, pesavel
+  - 'item1 + item2 + item3'      → vários itens
+  - '3 x 789... + 1 x 789...'   → lista mista
+"""
 from __future__ import annotations
 
 import re
-from decimal import Decimal, InvalidOperation
-from typing import Any, List, Tuple
+from typing import Any, Dict, List
 
-from models import ParsedItem
-
-ITEM_PATTERN = re.compile(r'^\s*(?P<qtd>[0-9]+(?:[\.,][0-9]+)?)\s*x\s*(?P<codigo>.+)$', re.IGNORECASE)
-SPECIAL_KEYWORDS = ['pesable', 'acrescimo', 'acréscimo', 'desconto no subtotal', 'subtotal']
-
-
-def _to_decimal(text: str) -> Decimal:
-    return Decimal(text.replace(',', '.').strip())
+# Padrão: <quantidade> x <codigo>  (quantidade pode ter ponto ou vírgula decimal)
+ITEM_PATTERN = re.compile(
+    r"^\s*(?P<qtd>[0-9]+(?:[.,][0-9]+)?)\s*x\s*(?P<codigo>.+)$",
+    re.IGNORECASE,
+)
 
 
-def _classify_codigo(codigo: str) -> str:
-    lower = codigo.lower().strip()
-    if 'pesable' in lower:
-        return 'pesavel'
-    if codigo.strip().isdigit():
-        return 'ean'
-    if any(k in lower for k in SPECIAL_KEYWORDS):
-        return 'contexto'
-    return 'texto'
+def _detect_tipo(codigo: str) -> str:
+    codigo_strip = codigo.strip()
+    if "pesable" in codigo_strip.lower():
+        return "pesavel"
+    if re.fullmatch(r"[0-9]+", codigo_strip):
+        return "ean"
+    return "texto"
 
 
-def parse_itens(itens_raw: Any) -> Tuple[List[ParsedItem], List[str]]:
+def _parse_qtd(qtd_str: str) -> float:
+    return float(qtd_str.replace(",", "."))
+
+
+def parse_itens(itens_raw: Any) -> List[Dict[str, Any]]:
+    """Converte itens_raw em lista de dicts estruturados.
+
+    Retorna lista vazia se o campo for nulo ou não reconhecido.
+    """
     if itens_raw is None:
-        return [], []
+        return []
     raw_str = str(itens_raw).strip()
-    if not raw_str:
-        return [], []
+    if not raw_str or raw_str.lower() in ("nan", "none", ""):
+        return []
 
-    partes = [p.strip() for p in raw_str.split('+') if p.strip()]
-    itens: List[ParsedItem] = []
-    alertas: List[str] = []
+    partes = [p.strip() for p in raw_str.split("+") if p.strip()]
+    itens: List[Dict[str, Any]] = []
 
     for parte in partes:
         m = ITEM_PATTERN.match(parte)
-        try:
-            if m:
-                qtd = _to_decimal(m.group('qtd'))
-                codigo = m.group('codigo').strip()
-            else:
-                qtd = Decimal('1')
-                codigo = parte.strip()
-        except (InvalidOperation, ValueError):
-            alertas.append(f'Quantidade inválida no item: {parte}')
-            continue
+        if m:
+            qtd = _parse_qtd(m.group("qtd"))
+            codigo = m.group("codigo").strip()
+        else:
+            qtd = 1.0
+            codigo = parte.strip()
 
-        tipo = _classify_codigo(codigo)
-        if tipo == 'contexto':
-            alertas.append(f'Item com contexto especial detectado: {parte}')
+        tipo = _detect_tipo(codigo)
+        itens.append(
+            {
+                "codigo": codigo,
+                "quantidade": qtd,
+                "tipo": tipo,
+                "raw_parte": parte,
+            }
+        )
 
-        itens.append(ParsedItem(
-            codigo=codigo,
-            quantidade=qtd,
-            tipo=tipo,
-            original=parte,
-        ))
-
-    return itens, alertas
+    return itens

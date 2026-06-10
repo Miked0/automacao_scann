@@ -1,136 +1,149 @@
-from __future__ import annotations
+"""Reader da planilha de roteiro de testes.
 
+Responsabilidades:
+- Abrir o arquivo XLSX sem assumir posição de cabeçalho
+- Localizar automaticamente linhas de cabeçalho úteis
+- Identificar blocos de teste (Venda Normal, Cancelamento, etc.)
+- Extrair apenas linhas que são casos de teste reais
+- Montar o modelo interno base com campos brutos
+"""
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-from models import TestCase
-
-COLUMN_ALIASES = {
-    'teste': ['teste'],
-    'tipo_promo': ['tipo promo', 'tipo promocion', 'promo'],
-    'itens_raw': ['itens da venda', 'articulos movimiento', 'articulos', 'items'],
-    'pagamento_raw': ['pagamento', 'pago', 'forma de pagamento'],
-    'observacoes_raw': ['observacoes', 'observações', 'obs', 'observacion', 'observaciones'],
-    'subtotal_raw': ['sub-total', 'subtotal'],
-    'desconto_raw': ['desconto', 'descuento'],
-    'total_raw': ['total'],
-    'status_tecnico_raw': ['status tecnico', 'status técnico', 'status'],
+# Mapeamento interno -> lista de aliases aceitos (lowercase, sem acentos)
+COLUMN_ALIASES: Dict[str, List[str]] = {
+    "teste": ["teste", "test", "caso"],
+    "tipo_promo": ["tipo promo", "tipo promocion", "tipo promoção", "tipo_promo"],
+    "itens_raw": [
+        "itens da venda",
+        "itens",
+        "articulos movimiento",
+        "articulos",
+        "produtos",
+    ],
+    "pagamento_raw": ["pagamento", "pago", "forma de pago", "forma pagamento"],
+    "observacoes_raw": [
+        "observacoes",
+        "observações",
+        "obs",
+        "observacion",
+        "observaciones",
+    ],
+    "subtotal_raw": ["sub-total", "subtotal", "sub total"],
+    "desconto_raw": ["desconto", "descuento", "desc"],
+    "total_raw": ["total"],
 }
-REQUIRED_FIELDS = {'teste', 'total_raw', 'itens_raw'}
+
+# Colunas obrigatórias para considerar uma linha como cabeçalho válido
+REQUIRED_COLS = {"teste", "total_raw"}
 
 
-def _normalize_text(value: Any) -> str:
-    if value is None:
-        return ''
-    text = str(value).strip().lower()
-    return ' '.join(text.split())
+def _norm(value: Any) -> str:
+    """Normaliza valor para comparação: lowercase, sem espaços extras."""
+    import unicodedata
+    s = str(value).strip().lower()
+    # remove acentos
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return s
 
 
-def _row_values(row: pd.Series) -> List[str]:
-    return [_normalize_text(v) for v in row.tolist()]
-
-
-def _match_columns(header_row: List[Any]) -> Dict[str, int]:
-    normalized = [_normalize_text(c) for c in header_row]
+def _match_columns(row: List[Any]) -> Dict[str, int]:
+    """Tenta casar a linha com os aliases e retorna mapeamento campo->índice."""
+    normalized = [_norm(c) for c in row]
     mapping: Dict[str, int] = {}
     for internal, aliases in COLUMN_ALIASES.items():
         for i, col in enumerate(normalized):
             if any(alias in col for alias in aliases):
-                mapping[internal] = i
+                if internal not in mapping:  # primeiro match vence
+                    mapping[internal] = i
                 break
-    return mapping if REQUIRED_FIELDS.issubset(mapping.keys()) else {}
+    if REQUIRED_COLS.issubset(mapping.keys()):
+        return mapping
+    return {}
 
 
-def _is_new_header(row: pd.Series) -> bool:
-    return bool(_match_columns(row.tolist()))
+def _detect_blocks(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """Percorre o dataframe procurando linhas que parecem cabeçalho.
 
-
-def _looks_like_test_id(value: Any) -> bool:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return False
-    text = str(value).strip()
-    if not text:
-        return False
-    return any(ch.isdigit() for ch in text)
-
-
-def _extract_block_name(df: pd.DataFrame, header_row_index: int) -> str:
-    start = max(0, header_row_index - 3)
-    for idx in range(header_row_index - 1, start - 1, -1):
-        row_text = ' | '.join([t for t in _row_values(df.iloc[idx]) if t])
-        if row_text and 'teste' not in row_text and len(row_text) > 3:
-            return row_text[:120]
-    return f'Bloco_{header_row_index + 1}'
-
-
-def find_blocks(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    Retorna lista de blocos com nome, índice da linha de cabeçalho
+    e mapeamento de colunas.
+    """
     blocks: List[Dict[str, Any]] = []
-    for idx, row in df.iterrows():
-        mapping = _match_columns(row.tolist())
+    for idx in range(len(df)):
+        row = list(df.iloc[idx].values)
+        mapping = _match_columns(row)
         if mapping:
-            blocks.append({
-                'bloco_nome': _extract_block_name(df, idx),
-                'header_row_index': idx,
-                'column_mapping': mapping,
-            })
+            # tenta capturar nome do bloco a partir de linhas acima
+            bloco_nome = _infer_block_name(df, idx, len(blocks) + 1)
+            blocks.append(
+                {
+                    "bloco_nome": bloco_nome,
+                    "header_row_index": idx,
+                    "column_mapping": mapping,
+                }
+            )
     return blocks
 
 
-def _safe_get(row: pd.Series, idx: Optional[int]) -> Any:
-    if idx is None:
-        return None
-    if idx >= len(row):
-        return None
-    return row.iloc[idx]
+def _infer_block_name(df: pd.DataFrame, header_idx: int, fallback_num: int) -> str:
+    """Tenta encontrar o nome do bloco nas linhas anteriores ao cabeçalho."""
+    for lookback in range(1, 5):
+        candidate_idx = header_idx - lookback
+        if candidate_idx < 0:
+            break
+        row_vals = [str(v).strip() for v in df.iloc[candidate_idx].values if str(v).strip() not in ("", "nan", "None")]
+        if row_vals:
+            name = row_vals[0]
+            # só aceita como nome se parecer título (sem números puros, tamanho razoável)
+            if len(name) > 3 and not name.replace(".", "").replace(",", "").isdigit():
+                return name
+    return f"Bloco_{fallback_num}"
 
 
-def load_roteiro_tests(path: Path, sheet_name: int | str = 0) -> Tuple[List[TestCase], List[Dict[str, Any]]]:
-    df = pd.read_excel(path, header=None, sheet_name=sheet_name, dtype=object)
-    blocks = find_blocks(df)
-    tests: List[TestCase] = []
+def _is_empty_row(row: pd.Series) -> bool:
+    return row.isna().all() or all(str(v).strip() in ("", "nan", "None") for v in row.values)
 
+
+def _extract_rows(df: pd.DataFrame, block: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Extrai as linhas de teste de um bloco."""
+    col_map = block["column_mapping"]
+    header_idx = block["header_row_index"]
+    bloco_nome = block["bloco_nome"]
+    rows: List[Dict[str, Any]] = []
+
+    for idx in range(header_idx + 1, len(df)):
+        row = df.iloc[idx]
+        if _is_empty_row(row):
+            break
+        # ignora linhas sem identificador de teste
+        teste_val = row.iloc[col_map["teste"]]
+        if pd.isna(teste_val) or str(teste_val).strip() in ("", "nan", "None"):
+            continue
+
+        record: Dict[str, Any] = {"bloco": bloco_nome}
+        for field, col_idx in col_map.items():
+            raw_val = row.iloc[col_idx]
+            record[field] = None if pd.isna(raw_val) or str(raw_val).strip() in ("nan", "None") else str(raw_val).strip()
+        rows.append(record)
+    return rows
+
+
+def load_roteiro_tests(path: Path) -> List[Dict[str, Any]]:
+    """Carrega o roteiro e devolve lista de registros no modelo interno base."""
+    df = pd.read_excel(path, header=None, dtype=str)
+    blocks = _detect_blocks(df)
+
+    if not blocks:
+        raise ValueError("Nenhum bloco de teste encontrado na planilha. Verifique os cabeçalhos.")
+
+    print(f"[INFO] {len(blocks)} bloco(s) detectado(s): {[b['bloco_nome'] for b in blocks]}")
+
+    all_tests: List[Dict[str, Any]] = []
     for block in blocks:
-        bloco_nome = block['bloco_nome']
-        header_row_index = block['header_row_index']
-        col_map = block['column_mapping']
-
-        for idx in range(header_row_index + 1, len(df)):
-            row = df.iloc[idx]
-            if row.isna().all():
-                break
-            if _is_new_header(row):
-                break
-
-            teste_val = _safe_get(row, col_map.get('teste'))
-            itens_val = _safe_get(row, col_map.get('itens_raw'))
-            total_val = _safe_get(row, col_map.get('total_raw'))
-
-            if not _looks_like_test_id(teste_val):
-                continue
-            if all(v is None or str(v).strip() == '' or (isinstance(v, float) and pd.isna(v)) for v in [itens_val, total_val]):
-                continue
-
-            known_indices = set(col_map.values())
-            extra_fields = {}
-            for c_idx, value in enumerate(row.tolist()):
-                if c_idx not in known_indices and value is not None and str(value).strip() != '':
-                    extra_fields[f'extra_col_{c_idx}'] = value
-
-            tests.append(TestCase(
-                bloco=bloco_nome,
-                row_index=idx,
-                teste=teste_val,
-                tipo_promo=_safe_get(row, col_map.get('tipo_promo')),
-                itens_raw=_safe_get(row, col_map.get('itens_raw')),
-                pagamento_raw=_safe_get(row, col_map.get('pagamento_raw')),
-                observacoes_raw=_safe_get(row, col_map.get('observacoes_raw')),
-                subtotal_raw=_safe_get(row, col_map.get('subtotal_raw')),
-                desconto_raw=_safe_get(row, col_map.get('desconto_raw')),
-                total_raw=_safe_get(row, col_map.get('total_raw')),
-                status_tecnico_raw=_safe_get(row, col_map.get('status_tecnico_raw')),
-                extra_fields=extra_fields,
-            ))
-
-    return tests, blocks
+        rows = _extract_rows(df, block)
+        print(f"  → {block['bloco_nome']}: {len(rows)} caso(s)")
+        all_tests.extend(rows)
+    return all_tests
