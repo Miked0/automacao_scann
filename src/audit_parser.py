@@ -43,9 +43,7 @@ class AuditParser:
         Normaliza aspas duplas escapadas e tenta json.loads.
         Fallback: extrai campos via regex se o JSON estiver malformado.
         """
-        # Normaliza "" → " (padrão de escape do export)
         normalized = raw.replace('""', '"').strip()
-        # Remove wrapping de aspas externas, se houver
         if normalized.startswith('"') and normalized.endswith('"'):
             normalized = normalized[1:-1]
 
@@ -56,18 +54,17 @@ class AuditParser:
         except json.JSONDecodeError:
             pass
 
-        # Fallback regex: extrai campos chave manualmente
         return self._regex_fallback(normalized)
 
     def _regex_fallback(self, text: str) -> Optional[dict]:
         """Extrai campos mínimos via regex quando o JSON está malformado."""
         result: dict = {}
         patterns = {
-            "numero":         r'"numero"\s*:\s*"([^"]+)"',
-            "total":          r'"total"\s*:\s*([\d.]+)',
-            "descuentoTotal": r'"descuentoTotal"\s*:\s*([\d.]+)',
-            "cancelacion":    r'"cancelacion"\s*:\s*(true|false)',
-            "status":         r'"status"\s*:\s*(\d+)',
+            "numero":        r'"numero"\s*:\s*"([^"]+)"',
+            "total":         r'"total"\s*:\s*([\d.]+)',
+            "descuentoTotal":r'"descuentoTotal"\s*:\s*([\d.]+)',
+            "cancelacion":   r'"cancelacion"\s*:\s*(true|false)',
+            "status":        r'"status"\s*:\s*(\d+)',
         }
         for key, pat in patterns.items():
             m = re.search(pat, text)
@@ -98,7 +95,6 @@ class AuditParser:
     def get_by_eans(self, eans: list[str]) -> list[dict]:
         """
         Fallback: busca movimentos cujos detalles contenham ao menos um EAN da lista.
-        Útil quando o número do cupom não está disponível.
         """
         results = []
         for movements in self._index.values():
