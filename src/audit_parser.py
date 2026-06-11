@@ -23,19 +23,7 @@ class AuditParser:
         self._build_index()
 
     # ------------------------------------------------------------------
-    # Interface pública chamada pelo orquestrador
-    # ------------------------------------------------------------------
-
-    def build_index(self) -> dict:
-        """
-        Alias público → retorna o índice já construído no __init__.
-        Chamado pelo scanntech_qa_validator.py como:
-            movements = audit_parser.build_index()
-        """
-        return self._index
-
-    # ------------------------------------------------------------------
-    # Construção do índice (privado — executado no __init__)
+    # Construção do índice
     # ------------------------------------------------------------------
 
     def _build_index(self) -> None:
@@ -55,7 +43,9 @@ class AuditParser:
         Normaliza aspas duplas escapadas e tenta json.loads.
         Fallback: extrai campos via regex se o JSON estiver malformado.
         """
+        # Normaliza "" → " (padrão de escape do export)
         normalized = raw.replace('""', '"').strip()
+        # Remove wrapping externo de aspas, se houver
         if normalized.startswith('"') and normalized.endswith('"'):
             normalized = normalized[1:-1]
 
@@ -97,7 +87,7 @@ class AuditParser:
         return None
 
     # ------------------------------------------------------------------
-    # Consultas
+    # Consultas públicas
     # ------------------------------------------------------------------
 
     def get_by_numero(self, numero: str) -> list[dict]:
@@ -105,7 +95,10 @@ class AuditParser:
         return self._index.get(str(numero).strip(), [])
 
     def get_by_eans(self, eans: list[str]) -> list[dict]:
-        """Fallback: busca movimentos cujos detalles contenham ao menos um EAN."""
+        """
+        Fallback: busca movimentos cujos detalles contenham ao menos um EAN da lista.
+        Útil quando o número do cupom não está disponível.
+        """
         results = []
         for movements in self._index.values():
             for mov in movements:

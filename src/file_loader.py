@@ -3,7 +3,6 @@ Módulo 1 — FileLoader
 Responsabilidade: Valida existência e carrega todos os artefatos.
 """
 
-import json
 import logging
 from pathlib import Path
 from typing import Optional
@@ -31,29 +30,7 @@ class FileLoader:
         self.json_dir     = Path(json_dir) if json_dir else None
 
     # ------------------------------------------------------------------
-    # Interfaces públicas chamadas pelo orquestrador
-    # ------------------------------------------------------------------
-
-    def validate(self) -> None:
-        """Alias público → validate_paths(). Chamado pelo orquestrador."""
-        self.validate_paths()
-
-    def load(self) -> tuple:
-        """
-        Alias público → load_all().
-        Retorna (workbook, audit_df, pdf_pages, extra_jsons) conforme
-        assinatura esperada pelo scanntech_qa_validator.py.
-        """
-        data = self.load_all()
-        return (
-            data["workbook"],
-            data["audit_df"],
-            data["pdf_pages"],
-            data["json_files"],
-        )
-
-    # ------------------------------------------------------------------
-    # Validação de existência
+    # Validação
     # ------------------------------------------------------------------
 
     def validate_paths(self) -> None:
@@ -72,16 +49,16 @@ class FileLoader:
             raise FileNotFoundError(f"Diretório JSON não encontrado: {self.json_dir}")
 
     # ------------------------------------------------------------------
-    # Carregamento
+    # Carregamento individual
     # ------------------------------------------------------------------
 
     def load_roteiro(self) -> openpyxl.Workbook:
-        """Carrega o TEMPLATE xlsx em modo data_only=True."""
+        """Carrega o TEMPLATE xlsx em modo data_only=True (preserva valores calculados)."""
         logger.info("Carregando roteiro: %s", self.roteiro_path)
         return openpyxl.load_workbook(self.roteiro_path, data_only=True)
 
     def load_audit(self) -> pd.DataFrame:
-        """Carrega o export Audit como DataFrame (aba AUDIT_TICKETS)."""
+        """Carrega o export Audit como DataFrame, priorizando a aba AUDIT_TICKETS."""
         logger.info("Carregando audit: %s", self.audit_path)
         try:
             df = pd.read_excel(self.audit_path, sheet_name="AUDIT_TICKETS")
@@ -103,23 +80,24 @@ class FileLoader:
         logger.info("PDF carregado: %d páginas", len(pages))
         return pages
 
-    def list_json_files(self) -> list:
-        """Lista e carrega JSONs do diretório opcional."""
+    def list_json_files(self) -> list[Path]:
+        """Lista arquivos JSON no diretório opcional."""
         if not self.json_dir:
             return []
         files = sorted(self.json_dir.glob("*.json"))
-        loaded = []
-        for f in files:
-            try:
-                with open(f, encoding="utf-8") as fh:
-                    loaded.append(json.load(fh))
-            except Exception as e:
-                logger.warning("JSON ignorado (%s): %s", f.name, e)
-        logger.info("JSON dir: %d arquivos carregados", len(loaded))
-        return loaded
+        logger.info("JSON dir: %d arquivos encontrados", len(files))
+        return files
+
+    # ------------------------------------------------------------------
+    # Carregamento unificado
+    # ------------------------------------------------------------------
 
     def load_all(self) -> dict:
-        """Valida e carrega todos os artefatos de uma vez."""
+        """Valida e carrega todos os artefatos de uma vez.
+
+        Returns:
+            dict com chaves: workbook, audit_df, pdf_pages, json_files
+        """
         self.validate_paths()
         return {
             "workbook":   self.load_roteiro(),

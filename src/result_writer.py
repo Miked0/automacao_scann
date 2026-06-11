@@ -1,111 +1,99 @@
 """
-M6 — ResultWriter
-Preenche as colunas de resultado (R, S, T, U) no workbook e salva o xlsx.
+Módulo 6 — ResultWriter
+Responsabilidade: Preenche colunas de resultado + salva xlsx.
 
-Regras:
-  - Detecta colunas de resultado pelo índice do cabeçalho dinâmico.
-  - Escreve 'Ok' (verde #C6EFCE) ou 'Erro' (vermelho #FFC7CE).
-  - Em caso de ERRO, preenche coluna U com justificativa ≤ 100 chars.
-  - Não altera nenhuma célula fora das colunas de resultado.
+Colunas de resultado (detectadas dinamicamente ou fallback R/S/T/U):
+  - col_sat  → "Ok" / "Erro" + fill verde/vermelho
+  - col_ecf  → "Ok" / "Erro" + fill verde/vermelho
+  - col_nfce → "Ok" / "Erro" + fill verde/vermelho
+  - col_just → justificativa ≤ 100 chars em caso de ERRO
 """
 
-from __future__ import annotations
 import logging
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Optional
 
-from openpyxl import Workbook
+import openpyxl
 from openpyxl.styles import PatternFill
 
-from .models import TestResult
+from .test_runner import TestResult
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
-# Cores de preenchimento
-_FILL_OK  = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-_FILL_ERR = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+FILL_OK   = PatternFill("solid", fgColor="C6EFCE")
+FILL_ERRO = PatternFill("solid", fgColor="FFC7CE")
 
-# Palavras-chave para encontrar as colunas de resultado no cabeçalho
-_RESULT_COLS = {
-    "col_sat":    ("sat",  "resultado sat",  "json sat"),
-    "col_ecf":    ("ecf",  "resultado ecf",  "json ecf"),
-    "col_nfce":   ("nfce", "resultado nfce", "json nfce"),
-    "col_just":   ("justificativa", "motivo", "observ resultado"),
-}
+# Palavras-chave usadas para detectar a linha de cabeçalho
+KEYWORDS_HEADER = {"teste", "tipo", "promo", "roteiro", "etapa", "descricao"}
 
-# Palavras-chave para detectar linha de cabeçalho
-_HEADER_KW = {"teste", "tipo", "promo", "cupom", "total", "desconto", "resultado"}
+
+def _detect_header_row(ws) -> int:
+    """Detecta a linha de cabeçalho por palavras-chave."""
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value and any(
+                kw in str(cell.value).lower() for kw in KEYWORDS_HEADER
+            ):
+                return cell.row
+    return 1
+
+
+def _find_col_by_keyword(ws, header_row: int, keywords: list[str]) -> Optional[int]:
+    """Encontra índice (1-based) da coluna pelo conteúdo do cabeçalho."""
+    for cell in ws[header_row]:
+        if cell.value and any(kw in str(cell.value).lower() for kw in keywords):
+            return cell.column
+    return None
 
 
 class ResultWriter:
-    """Escreve resultados nas colunas corretas do roteiro XLSX."""
+    """Escreve resultados nas colunas corretas do TEMPLATE e salva o xlsx."""
 
-    def __init__(self, wb: Workbook) -> None:
-        self.wb      = wb
-        self.ws      = self._get_main_sheet()
-        self._header_row, self._col_indices = self._detect_result_columns()
+    def __init__(self, workbook: openpyxl.Workbook, output_path: str):
+        self.wb          = workbook
+        self.output_path = Path(output_path)
+        self.ws          = workbook.active
 
-    # ── Escrita ──────────────────────────────────────────────────────────────
-    def write(self, results: List[TestResult]) -> None:
-        idx = self._col_indices
-        if not idx:
-            log.warning("Colunas de resultado não detectadas — nada será escrito.")
-            return
+        self.header_row = _detect_header_row(self.ws)
 
-        for res in results:
-            row = res.linha
-            status = "Ok" if res.overall_ok else "Erro"
-            fill   = _FILL_OK if res.overall_ok else _FILL_ERR
+        # Detecta colunas de resultado dinamicamente
+        self.col_sat  = _find_col_by_keyword(self.ws, self.header_row, ["sat", "ecf"])
+        self.col_ecf  = _find_col_by_keyword(self.ws, self.header_row, ["ecf"])
+        self.col_nfce = _find_col_by_keyword(self.ws, self.header_row, ["nfc", "nfce"])
+        self.col_just = _find_col_by_keyword(
+            self.ws, self.header_row, ["just", "motivo", "obs"]
+        )
 
-            for col_key in ("col_sat", "col_ecf", "col_nfce"):
-                col = idx.get(col_key)
-                if col is not None:
-                    cell = self.ws.cell(row=row, column=col)
-                    cell.value = status
-                    cell.fill  = fill
+        # Fallback: R=18, S=19, T=20, U=21
+        if not self.col_sat:  self.col_sat  = 18
+        if not self.col_ecf:  self.col_ecf  = 19
+        if not self.col_nfce: self.col_nfce = 20
+        if not self.col_just: self.col_just = 21
 
-            if not res.overall_ok:
-                col_just = idx.get("col_just")
-                if col_just is not None:
-                    cell_j = self.ws.cell(row=row, column=col_just)
-                    cell_j.value = res.col_justificativa[:100]
-                    cell_j.fill  = _FILL_ERR
+        logger.info(
+            "ResultWriter colunas: SAT=%s ECF=%s NFCE=%s JUST=%s",
+            self.col_sat, self.col_ecf, self.col_nfce, self.col_just,
+        )
 
-        log.info("ResultWriter: %d linhas preenchidas.", len(results))
+    def write_result(self, result: TestResult, data_row: int) -> None:
+        """Preenche as colunas de resultado para uma linha de dado.
 
-    def save(self, output_path: str) -> None:
-        self.wb.save(output_path)
-        log.info("Workbook salvo em: %s", output_path)
+        Garante que apenas as colunas de resultado sejam modificadas.
+        """
+        status = "Ok"  if result.passed else "Erro"
+        fill   = FILL_OK if result.passed else FILL_ERRO
 
-    # ── Detecção dinâmica das colunas ────────────────────────────────────────
-    def _get_main_sheet(self):
-        for name in self.wb.sheetnames:
-            if any(k in name.lower() for k in ("roteiro", "teste", "planilha")):
-                return self.wb[name]
-        return self.wb.active
+        for col in (self.col_sat, self.col_ecf, self.col_nfce):
+            if col:
+                cell       = self.ws.cell(row=data_row, column=col)
+                cell.value = status
+                cell.fill  = fill
 
-    def _detect_result_columns(self) -> Tuple[int, Dict[str, int]]:
-        """Varre linhas em busca do cabeçalho e mapeia colunas de resultado."""
-        for row in self.ws.iter_rows():
-            texts = [str(c.value or "").lower().strip() for c in row]
-            n_kw  = sum(1 for t in texts if any(kw in t for kw in _HEADER_KW))
-            if n_kw < 2:
-                continue
+        if not result.passed and self.col_just:
+            cell       = self.ws.cell(row=data_row, column=self.col_just)
+            cell.value = result.motivo_erro  # ≤ 100 chars (garantido por TestResult)
 
-            col_map: Dict[str, int] = {}
-            for cell in row:
-                t = str(cell.value or "").lower().strip()
-                for result_key, keywords in _RESULT_COLS.items():
-                    if any(kw in t for kw in keywords) and result_key not in col_map:
-                        col_map[result_key] = cell.column  # 1-based
-
-            # Se não encontrou col_sat/ecf/nfce pelo nome, usa colunas R/S/T/U (18-21)
-            for i, default_key in enumerate(["col_sat", "col_ecf", "col_nfce", "col_just"], start=18):
-                if default_key not in col_map:
-                    col_map[default_key] = i
-
-            log.info("Colunas de resultado detectadas: %s", col_map)
-            return row[0].row, col_map
-
-        # Fallback total: colunas R/S/T/U
-        log.warning("Cabeçalho não detectado. Usando colunas padrão R/S/T/U.")
-        return 1, {"col_sat": 18, "col_ecf": 19, "col_nfce": 20, "col_just": 21}
+    def save(self) -> None:
+        """Salva o workbook no caminho de saída."""
+        self.wb.save(self.output_path)
+        logger.info("Resultado salvo em: %s", self.output_path)

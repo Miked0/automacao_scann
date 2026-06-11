@@ -1,327 +1,184 @@
 """
-M5 — TestRunner
-Orquestra a validação linha a linha do roteiro XLSX.
-
-Para cada linha executa 10 checks em sequência:
-  1. Cupom localizado
-  2. HTTP 200
-  3. Cancelamento
-  4. Total
-  5. Desconto
-  6. Meio de pagamento
-  7. BIN
-  8. Promoção (dispatcher PromoEngine)
-  9. Desconto manual indevido
-  10. Schema JSON mínimo
+Módulo 5 — TestRunner
+Responsabilidade: Orquestra a validação linha a linha do roteiro (10 checks).
 """
 
-from __future__ import annotations
 import logging
-import re
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Optional
 
-from openpyxl.workbook import Workbook
+from .audit_parser      import AuditParser
+from .coupon_pdf_parser import CouponPDFParser, Coupon
+from .promo_engine      import PromoEngine, TOLERANCE
 
-from .models import AuditMovement, CheckResult, CouponBlock, TestResult
-from .promo_engine import PromoEngine
+logger = logging.getLogger(__name__)
 
-log = logging.getLogger(__name__)
 
-TOLERANCE = 0.05
+@dataclass
+class CheckResult:
+    check:   str
+    ok:      bool
+    detalhe: str = ""
 
-# Mapeamento meio de pagamento → código Scanntech
-_PAGTO_MAP = {
-    "dinheiro": ["1", "01", "cash", "dinheiro"],
-    "credito":  ["2", "02", "credit", "credito", "crédito", "cartao credito"],
-    "debito":   ["3", "03", "debit", "debito",  "débito",  "cartao debito"],
-    "pix":      ["4", "04", "pix"],
-}
 
-# Palavras-chave para detecção dinâmica do cabeçalho
-_HEADER_KEYWORDS = {
-    "teste", "tipo", "promo", "cupom", "total", "desconto",
-    "pagamento", "bin", "observ", "resultado",
-}
+@dataclass
+class TestResult:
+    etapa:        str
+    linha:        int
+    cupom_numero: Optional[str]
+    checks:       list[CheckResult] = field(default_factory=list)
+
+    @property
+    def passed(self) -> bool:
+        return all(c.ok for c in self.checks)
+
+    @property
+    def motivo_erro(self) -> str:
+        for c in self.checks:
+            if not c.ok:
+                return c.detalhe[:100]
+        return ""
 
 
 class TestRunner:
-    """Itera sobre o roteiro e executa os 10 checks por linha."""
+    """
+    Executa os 10 checks em sequência para cada linha do roteiro.
+    Aplica falha rápida nos checks mais críticos (cupom e HTTP).
+    """
 
     def __init__(
         self,
-        wb_roteiro: Workbook,
-        movements:  Dict[str, AuditMovement],
-        coupons:    List[CouponBlock],
-        promo_engine: PromoEngine,
-        extra_jsons: List[Dict] = None,
-    ) -> None:
-        self.wb          = wb_roteiro
-        self.movements   = movements
-        self.coupons     = coupons
-        self.engine      = promo_engine
-        self.extra_jsons = extra_jsons or []
+        audit:  AuditParser,
+        pdf:    CouponPDFParser,
+        promo:  PromoEngine,
+    ):
+        self.audit = audit
+        self.pdf   = pdf
+        self.promo = promo
 
-    # ── Ponto de entrada ─────────────────────────────────────────────────────
-    def run(self) -> List[TestResult]:
-        results: List[TestResult] = []
-        ws = self._get_main_sheet()
-        header_row, col_map = self._detect_header(ws)
-        if not col_map:
-            log.error("Cabeçalho não detectado no roteiro. Abortando.")
-            return results
+    def run(self, row: dict, linha: int) -> TestResult:
+        etapa  = str(row.get("etapa", ""))
+        result = TestResult(etapa=etapa, linha=linha, cupom_numero=None)
 
-        etapa = ws.title
-        for row_idx in range(header_row + 1, ws.max_row + 1):
-            row_data = self._extract_row(ws, row_idx, col_map)
-            if not any(v for v in row_data.values() if v is not None and str(v).strip()):
-                continue  # Linha vazia
+        # ----------------------------------------------------------------
+        # Check 1 — Cupom localizado
+        # ----------------------------------------------------------------
+        numero = str(row.get("numero_cupom", "")).strip()
+        eans   = [str(e).strip() for e in row.get("eans", []) if e]
 
-            result = self._validate_row(etapa, row_idx, row_data)
-            results.append(result)
+        coupon:    Optional[Coupon] = None
+        movements: list[dict]       = []
 
-        return results
+        if numero:
+            coupon    = self.pdf.get_by_numero(numero)
+            movements = self.audit.get_by_numero(numero)
 
-    # ── Detecção de cabeçalho ────────────────────────────────────────────────
-    def _get_main_sheet(self):
-        for name in self.wb.sheetnames:
-            if any(k in name.lower() for k in ("roteiro", "teste", "planilha", "sheet")):
-                return self.wb[name]
-        return self.wb.active
+        if not coupon and eans:
+            coupon = self.pdf.get_by_eans(eans)
 
-    def _detect_header(self, ws) -> tuple:
-        for row in ws.iter_rows():
-            texts = [str(c.value or "").lower().strip() for c in row]
-            matches = sum(1 for t in texts if any(kw in t for kw in _HEADER_KEYWORDS))
-            if matches >= 2:
-                col_map = {}
-                for cell in row:
-                    key = str(cell.value or "").lower().strip()
-                    col_map[key] = cell.column - 1  # 0-based
-                return row[0].row, col_map
-        return 1, {}
+        if not movements and eans:
+            movements = self.audit.get_by_eans(eans)
 
-    def _extract_row(self, ws, row_idx: int, col_map: Dict) -> Dict:
-        cells = [c.value for c in ws[row_idx]]
-        return {key: (cells[idx] if idx < len(cells) else None)
-                for key, idx in col_map.items()}
-
-    # ── Validação de linha ───────────────────────────────────────────────────
-    def _validate_row(self, etapa: str, row_idx: int, row: Dict) -> TestResult:
-        result = TestResult(etapa=etapa, linha=row_idx)
-        checks: List[CheckResult] = []
-
-        cupom_key = self._normalize_cupom_key(row)
-        result.cupom_key = cupom_key
-
-        # 1. Cupom localizado
-        movement, coupon_block = self._find_movement(cupom_key, row)
-        if coupon_block:
-            result.coupons_used.append(
-                coupon_block.sat_number or coupon_block.nfce_number or coupon_block.coo_number or "?"
-            )
-        ck1 = CheckResult(
-            check="cupom_localizado",
-            ok=movement is not None,
-            detalhe=f"Cupom '{cupom_key}' {'encontrado' if movement else 'NÃO encontrado'} no Audit.",
+        found = coupon is not None or len(movements) > 0
+        result.cupom_numero = (
+            coupon.get_numero() if coupon
+            else (movements[0].get("numero") if movements else None)
         )
-        checks.append(ck1)
+        result.checks.append(CheckResult(
+            "cupom_localizado", found,
+            "" if found else f"Cupom não localizado: {numero or eans}"
+        ))
+        if not found:
+            return result  # falha rápida
 
-        if movement is None:
-            result.checks      = checks
-            result.overall_ok  = False
-            result.error_reason = ck1.detalhe
-            self._set_status_columns(result, "ERRO")
-            return result
+        mov = movements[0] if movements else {}
 
-        # 2-10. Restantes checks
-        checks.append(self._check_http200(movement))
-        checks.append(self._check_cancelamento(row, movement))
-        checks.append(self._check_total(row, movement))
-        checks.append(self._check_desconto(row, movement))
-        checks.append(self._check_pagamento(row, movement))
-        checks.append(self._check_bin(row, movement))
-        checks.append(self._check_promo(row, movement))
-        checks.append(self._check_desconto_indevido(row, movement))
-        checks.append(self._check_schema(movement))
+        # ----------------------------------------------------------------
+        # Check 2 — HTTP 200
+        # ----------------------------------------------------------------
+        status   = int(mov.get("status", mov.get("httpStatus", 0)))
+        ok_http  = status == 200
+        result.checks.append(CheckResult(
+            "http_200", ok_http,
+            "" if ok_http else f"Status HTTP: {status}"
+        ))
 
-        result.checks    = checks
-        failed           = [c for c in checks if not c.ok]
-        result.overall_ok = not failed
-        if failed:
-            result.error_reason = failed[0].detalhe[:100]
-
-        self._set_status_columns(result, "Ok" if result.overall_ok else "Erro")
-        return result
-
-    # ── Checks individuais ───────────────────────────────────────────────────
-    @staticmethod
-    def _check_http200(mv: AuditMovement) -> CheckResult:
-        ok = mv.status_code == 200
-        return CheckResult(
-            check="http200",
-            ok=ok,
-            detalhe=f"HTTP status={mv.status_code}",
-        )
-
-    @staticmethod
-    def _check_cancelamento(row: Dict, mv: AuditMovement) -> CheckResult:
-        obs = str(row.get("observ") or row.get("observacao") or "").lower()
-        esperado_cancel = "cancel" in obs
-        ok = mv.cancelacion == esperado_cancel
-        return CheckResult(
-            check="cancelamento",
-            ok=ok,
-            detalhe=f"cancelacion={mv.cancelacion} esperado={esperado_cancel}",
-        )
-
-    @staticmethod
-    def _check_total(row: Dict, mv: AuditMovement) -> CheckResult:
-        total_rot = _safe_float(row.get("total"))
-        if total_rot is None:
-            return CheckResult(check="total", ok=True, detalhe="Total não informado no roteiro — skip.")
-        diff = abs((mv.total or 0.0) - total_rot)
-        ok   = diff <= TOLERANCE
-        return CheckResult(
-            check="total",
-            ok=ok,
-            detalhe=f"total audit={mv.total:.2f} roteiro={total_rot:.2f} diff={diff:.4f}",
-        )
-
-    @staticmethod
-    def _check_desconto(row: Dict, mv: AuditMovement) -> CheckResult:
-        desc_rot = _safe_float(row.get("desconto"))
-        if desc_rot is None:
-            return CheckResult(check="desconto", ok=True, detalhe="Desconto não informado no roteiro — skip.")
-        diff = abs((mv.descuento_total or 0.0) - desc_rot)
-        ok   = diff <= TOLERANCE
-        return CheckResult(
-            check="desconto",
-            ok=ok,
-            detalhe=f"descuento audit={mv.descuento_total} roteiro={desc_rot} diff={diff:.4f}",
-        )
-
-    @staticmethod
-    def _check_pagamento(row: Dict, mv: AuditMovement) -> CheckResult:
-        tipo_rot = str(row.get("pagamento") or row.get("meio_pag") or "").lower().strip()
-        if not tipo_rot:
-            return CheckResult(check="pagamento", ok=True, detalhe="Pagamento não informado — skip.")
-
-        codigos_aceitos = []
-        for label, codigos in _PAGTO_MAP.items():
-            if label in tipo_rot or tipo_rot in codigos:
-                codigos_aceitos = codigos
-                break
-
-        for pago in mv.pagos:
-            codigo = str(pago.get("codigoTipoPago") or "").lower()
-            if codigo in codigos_aceitos or tipo_rot in codigos_aceitos:
-                return CheckResult(check="pagamento", ok=True, detalhe=f"Pagamento '{tipo_rot}' OK.")
-
-        return CheckResult(
-            check="pagamento",
-            ok=False,
-            detalhe=f"Pagamento '{tipo_rot}' não encontrado nos pagos do Audit.",
-        )
-
-    @staticmethod
-    def _check_bin(row: Dict, mv: AuditMovement) -> CheckResult:
-        obs     = str(row.get("observ") or row.get("bin") or "").upper()
-        bin_req = re.search(r"BIN[:\s]+([\dX]+)", obs)
-        if not bin_req:
-            return CheckResult(check="bin", ok=True, detalhe="BIN não exigido.")
-        bin_esperado = bin_req.group(1)
-        bin_audit    = str(mv.bin_value or "").upper()
-        ok = bin_esperado in bin_audit
-        return CheckResult(
-            check="bin",
-            ok=ok,
-            detalhe=f"BIN esperado={bin_esperado} audit={bin_audit}",
-        )
-
-    def _check_promo(self, row: Dict, mv: AuditMovement) -> CheckResult:
-        tipo_promo = str(row.get("tipo promo") or row.get("tipo_promo") or "").strip()
-        if not tipo_promo:
-            return CheckResult(check="promo", ok=True, detalhe="Tipo promoção não informado — skip.")
-        return self.engine.validate(tipo_promo, row, mv)
-
-    @staticmethod
-    def _check_desconto_indevido(row: Dict, mv: AuditMovement) -> CheckResult:
-        obs = str(row.get("observ") or "").lower()
-        if "sem desconto manual" in obs:
-            # Scanntech ativa: descuento deve ser somente o da promo
-            desc_rot   = _safe_float(row.get("desconto")) or 0.0
-            desc_audit = mv.descuento_total or 0.0
-            excesso    = desc_audit - desc_rot
-            ok = excesso <= TOLERANCE
-            return CheckResult(
-                check="desconto_indevido",
-                ok=ok,
-                detalhe=f"Desconto manual: excesso={excesso:.4f}",
-            )
-        return CheckResult(check="desconto_indevido", ok=True, detalhe="Sem restrição de desconto manual.")
-
-    @staticmethod
-    def _check_schema(mv: AuditMovement) -> CheckResult:
-        obrigatorios = {"total", "numero", "detalles", "pagos"}
-        presentes    = set(mv.raw_json.keys())
-        faltando     = obrigatorios - presentes
-        ok = not faltando
-        return CheckResult(
-            check="schema",
-            ok=ok,
-            detalhe=(
-                "Schema OK."
-                if ok
-                else f"Campos ausentes: {', '.join(sorted(faltando))}"
+        # ----------------------------------------------------------------
+        # Check 3 — Cancelamento
+        # ----------------------------------------------------------------
+        obs                = str(row.get("observacao", "")).lower()
+        cancelado_esperado = "cancelado" in obs or "cancelacion" in obs
+        cancelado_real     = bool(mov.get("cancelacion", False))
+        ok_cancel          = cancelado_esperado == cancelado_real
+        result.checks.append(CheckResult(
+            "cancelamento", ok_cancel,
+            "" if ok_cancel else (
+                f"Cancelamento esperado={cancelado_esperado} real={cancelado_real}"
             ),
-        )
+        ))
 
-    # ── Busca de movimento ───────────────────────────────────────────────────
-    def _find_movement(
-        self, cupom_key: str, row: Dict
-    ) -> tuple:
-        """Busca por SAT/ECF/NFCE ou fallback por EANs."""
-        if cupom_key and cupom_key in self.movements:
-            return self.movements[cupom_key], None
+        # ----------------------------------------------------------------
+        # Check 4 — Total
+        # ----------------------------------------------------------------
+        total_rot = float(row.get("total", 0))
+        total_mov = float(mov.get("total", 0))
+        ok_total  = abs(total_rot - total_mov) <= TOLERANCE
+        result.checks.append(CheckResult(
+            "total", ok_total,
+            "" if ok_total else (
+                f"Total roteiro={total_rot:.2f} movimento={total_mov:.2f}"
+            ),
+        ))
 
-        # Fallback: busca pelo conjunto de EANs do roteiro
-        eans_rot = self._extract_eans_from_row(row)
-        if eans_rot:
-            for key, mv in self.movements.items():
-                mv_eans = {str(d.get("codigoBarras") or "") for d in mv.detalles}
-                if eans_rot.issubset(mv_eans):
-                    log.debug("Match por EAN para cupom %s → %s", cupom_key, key)
-                    return mv, None
+        # ----------------------------------------------------------------
+        # Check 5 — Desconto
+        # ----------------------------------------------------------------
+        desc_rot = float(row.get("desconto", 0))
+        desc_mov = float(mov.get("descuentoTotal", 0))
+        ok_desc  = abs(desc_rot - desc_mov) <= TOLERANCE
+        result.checks.append(CheckResult(
+            "desconto", ok_desc,
+            "" if ok_desc else (
+                f"Desconto roteiro={desc_rot:.2f} mov={desc_mov:.2f}"
+            ),
+        ))
 
-        return None, None
+        # ----------------------------------------------------------------
+        # Check 6 — Meio de pagamento
+        # ----------------------------------------------------------------
+        tipo_pag_rot = str(row.get("meio_pagamento", ""))
+        tipo_pag_mov = str(mov.get("codigoTipoPago", ""))
+        res_pag      = self.promo.validate_pagamento(tipo_pag_mov, tipo_pag_rot)
+        result.checks.append(CheckResult("pagamento", res_pag.ok, res_pag.detalhe))
 
-    @staticmethod
-    def _normalize_cupom_key(row: Dict) -> str:
-        for campo in ("cupom", "nro_cupom", "numero_cupom", "sat", "nfce", "ecf"):
-            val = row.get(campo)
-            if val and str(val).strip():
-                return str(val).strip().lower()
-        return ""
+        # ----------------------------------------------------------------
+        # Check 7 — BIN (condicional)
+        # ----------------------------------------------------------------
+        bin_esp = str(row.get("bin", "")).strip()
+        if bin_esp:
+            res_bin = self.promo.validate_bin(mov, bin_esp)
+            result.checks.append(CheckResult("bin", res_bin.ok, res_bin.detalhe))
 
-    @staticmethod
-    def _extract_eans_from_row(row: Dict) -> set:
-        raw = str(row.get("ean") or row.get("eans") or "").strip()
-        if not raw:
-            return set()
-        return {e.strip() for e in re.split(r"[,;\s]+", raw) if re.match(r"\d{7,14}", e.strip())}
+        # ----------------------------------------------------------------
+        # Check 8 — Promoção (dispatcher por tipo)
+        # ----------------------------------------------------------------
+        tipo_promo  = str(row.get("tipo_promo", "")).strip()
+        promo_ativa = bool(row.get("promo_ativa", True))
 
-    # ── Status columns ───────────────────────────────────────────────────────
-    @staticmethod
-    def _set_status_columns(result: TestResult, status: str) -> None:
-        result.col_sat_status  = status
-        result.col_ecf_status  = status
-        result.col_nfce_status = status
-        if status == "Erro":
-            result.col_justificativa = result.error_reason[:100]
+        if tipo_promo:
+            res_promo = self.promo.validate(tipo_promo, mov, row)
+            result.checks.append(CheckResult("promocao", res_promo.ok, res_promo.detalhe))
 
+            # ------------------------------------------------------------
+            # Check 9 — Desconto manual indevido
+            # ------------------------------------------------------------
+            res_dm = self.promo.validate_desconto_manual(mov, obs, promo_ativa)
+            result.checks.append(CheckResult("desconto_manual", res_dm.ok, res_dm.detalhe))
 
-def _safe_float(val: Any) -> Optional[float]:
-    try:
-        return float(val)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return None
+        # ----------------------------------------------------------------
+        # Check 10 — Schema JSON mínimo
+        # ----------------------------------------------------------------
+        res_schema = self.promo.validate_schema(mov)
+        result.checks.append(CheckResult("schema_json", res_schema.ok, res_schema.detalhe))
+
+        return result

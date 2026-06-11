@@ -1,13 +1,28 @@
 """
 Módulo 7 — AuditLogger
 Responsabilidade: Gera log JSON estruturado de cada check.
+
+Artefato gerado: qa_audit_log.json
+Estrutura de cada entrada:
+  {
+    "timestamp": "ISO-8601",
+    "etapa": str,
+    "linha": int,
+    "cupom_numero": str | null,
+    "cupons_utilizados": [str],
+    "passou": bool,
+    "motivo_erro": str,
+    "checks": [{"check": str, "ok": bool, "detalhe": str}]
+  }
 """
 
 import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
+
+from .test_runner import TestResult
 
 logger = logging.getLogger(__name__)
 
@@ -19,50 +34,27 @@ class AuditLogger:
         self.log_path  = Path(log_path)
         self._entries: list[dict] = []
 
-    # ------------------------------------------------------------------
-    # Interface pública chamada pelo orquestrador
-    # ------------------------------------------------------------------
-
-    def write(self, results: list) -> None:
-        """
-        Alias público compatível com o orquestrador:
-            audit_logger.write(results)
-        Registra todos os TestResult e persiste o JSON.
-        """
-        for result in results:
-            self.record(result)
-        self.flush()
-
-    # ------------------------------------------------------------------
-    # API granular (para uso direto ou testes)
-    # ------------------------------------------------------------------
-
-    def record(self, result, cupons_utilizados: Optional[list] = None) -> None:
+    def record(
+        self,
+        result: TestResult,
+        cupons_utilizados: Optional[list[str]] = None,
+    ) -> None:
         """Adiciona entrada de um teste ao log em memória."""
-        # Suporte a TestResult com atributo overall_ok (novo) ou passed (legado)
-        passou = getattr(result, "overall_ok", None)
-        if passou is None:
-            passou = getattr(result, "passed", False)
-
-        motivo = getattr(result, "error_reason", None) or getattr(result, "motivo_erro", "")
-
         entry = {
             "timestamp":         datetime.now().isoformat(),
-            "etapa":             getattr(result, "etapa", ""),
-            "linha":             getattr(result, "linha", 0),
-            "cupom_numero":      getattr(result, "cupom_numero",  None)
-                                  or getattr(result, "cupom_key", None),
-            "cupons_utilizados": cupons_utilizados
-                                  or getattr(result, "coupons_used", []),
-            "passou":            passou,
-            "motivo_erro":       motivo,
+            "etapa":             result.etapa,
+            "linha":             result.linha,
+            "cupom_numero":      result.cupom_numero,
+            "cupons_utilizados": cupons_utilizados or [],
+            "passou":            result.passed,
+            "motivo_erro":       result.motivo_erro,
             "checks": [
                 {
                     "check":   c.check,
                     "ok":      c.ok,
                     "detalhe": c.detalhe,
                 }
-                for c in getattr(result, "checks", [])
+                for c in result.checks
             ],
         }
         self._entries.append(entry)
@@ -77,7 +69,7 @@ class AuditLogger:
         )
 
     def summary(self) -> dict:
-        """Retorna um resumo estatístico da execução."""
+        """Retorna resumo estatístico da execução."""
         total  = len(self._entries)
         passou = sum(1 for e in self._entries if e["passou"])
         return {
