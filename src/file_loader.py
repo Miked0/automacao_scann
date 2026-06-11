@@ -25,16 +25,16 @@ class FileLoader:
         json_dir: Optional[str] = None,
     ):
         self.roteiro_path = Path(roteiro_path)
-        self.audit_path   = Path(audit_path)
-        self.pdf_path     = Path(pdf_path)
-        self.json_dir     = Path(json_dir) if json_dir else None
+        self.audit_path = Path(audit_path)
+        self.pdf_path = Path(pdf_path)
+        self.json_dir = Path(json_dir) if json_dir else None
 
     def validate_paths(self) -> None:
         """Lança FileNotFoundError se qualquer artefato obrigatório não existir."""
         required = [
             (self.roteiro_path, "Roteiro (TEMPLATE xlsx)"),
-            (self.audit_path,   "Export Audit xlsx"),
-            (self.pdf_path,     "PDF de cupons"),
+            (self.audit_path, "Export Audit xlsx"),
+            (self.pdf_path, "PDF de cupons"),
         ]
         for path, label in required:
             if not path.exists():
@@ -84,8 +84,8 @@ class FileLoader:
         """Valida e carrega todos os artefatos de uma vez."""
         self.validate_paths()
         return {
-            "workbook":   self.load_roteiro(),
-            "audit_df":   self.load_audit(),
-            "pdf_pages":  self.load_pdf_text_blocks(),
+            "workbook": self.load_roteiro(),
+            "audit_df": self.load_audit(),
+            "pdf_pages": self.load_pdf_text_blocks(),
             "json_files": self.list_json_files(),
         }
