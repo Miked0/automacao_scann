@@ -2,14 +2,19 @@
 Módulo 2 — AuditParser
 Responsabilidade: Indexa movimentos do export Audit pelo nº cupom.
 
+Estrutura do export Audit (AUDIT_TICKETS):
+  Coluna I → status HTTP da resposta (200, 400, etc.)
+  Coluna S → JSON do Request (corpo enviado à API Scanntech)
+
 Estrutura de índice:
-  _index_numero : { numero (str) → list[dict] }   ← campo "numero" do JSON da API
+  _index_numero : { numero (str) → list[dict] }   ← campo "numero" do JSON
   _index_nfce   : { numeroNFCe (str) → list[dict] }
   _index_sat    : { numeroSAT  (str) → list[dict] }
   _index_ecf    : { numeroCOO  (str) → list[dict] }
 
-Todos os campos são extraídos do JSON presente na coluna "Request"
-do export Audit (AUDIT_TICKETS), normalizando as aspas duplas escapadas.
+O dicionário de cada movimento contém:
+  - Todos os campos do JSON do Request
+  - "_http_status" (int): status HTTP lido da coluna I do DataFrame
 """
 
 import json
@@ -21,16 +26,69 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Nomes conhecidos da coluna de status HTTP no export Audit.
+# O script tenta cada um em ordem até encontrar; fallback = posição 8 (col I).
+# ---------------------------------------------------------------------------
+_STATUS_COL_ALIASES = [
+    "status", "httpstatus", "http_status", "statuscode",
+    "http status", "response code", "responsecode", "codigo", "código",
+    "status code", "status_code",
+]
+
+# Nomes conhecidos da coluna de Request JSON no export Audit.
+# Fallback = posição 18 (col S).
+_REQUEST_COL_ALIASES = [
+    "request", "json", "body", "payload", "request body",
+    "request_body", "requestbody", "req",
+]
+
+
+def _find_col(df: pd.DataFrame, aliases: list[str], fallback_pos: int) -> str:
+    """
+    Retorna o nome da coluna do DataFrame que corresponde a um dos aliases.
+    Se nenhum alias for encontrado, usa a coluna pela posição (0-based).
+    """
+    cols_lower = {str(c).strip().lower(): c for c in df.columns}
+    for alias in aliases:
+        if alias in cols_lower:
+            found = cols_lower[alias]
+            logger.info("Coluna detectada '%s' pelo alias '%s'", found, alias)
+            return found
+
+    # Fallback por posição
+    if fallback_pos < len(df.columns):
+        found = df.columns[fallback_pos]
+        logger.warning(
+            "Coluna não detectada por alias; usando posição %d → '%s'",
+            fallback_pos, found
+        )
+        return found
+
+    # Último recurso: primeira coluna
+    logger.warning("Fallback de posição inválido; usando primeira coluna.")
+    return df.columns[0]
+
 
 class AuditParser:
     """Parseia e indexa o export Audit por múltiplas chaves de cupom."""
 
     def __init__(self, audit_df: pd.DataFrame):
         self.audit_df = audit_df
-        self._index_numero: dict[str, list[dict]] = {}  # campo "numero" do JSON
+        self._index_numero: dict[str, list[dict]] = {}
         self._index_nfce:   dict[str, list[dict]] = {}
         self._index_sat:    dict[str, list[dict]] = {}
         self._index_ecf:    dict[str, list[dict]] = {}
+
+        # Detecta as colunas corretas antes de indexar
+        self._col_status  = _find_col(audit_df, _STATUS_COL_ALIASES,  fallback_pos=8)   # col I
+        self._col_request = _find_col(audit_df, _REQUEST_COL_ALIASES, fallback_pos=18)  # col S
+
+        logger.info(
+            "AuditParser: coluna status='%s' (I), coluna request='%s' (S)",
+            self._col_status, self._col_request
+        )
+
         self._build_index()
 
     # ------------------------------------------------------------------
@@ -39,17 +97,29 @@ class AuditParser:
 
     def _build_index(self) -> None:
         for _, row in self.audit_df.iterrows():
-            raw = row.get("Request", "")
-            movement = self._parse_request(str(raw))
+            # --- Status HTTP da coluna I ---
+            raw_status = row.get(self._col_status, 0)
+            try:
+                http_status = int(float(str(raw_status).strip()))
+            except (ValueError, TypeError):
+                http_status = 0
+
+            # --- JSON do Request da coluna S ---
+            raw_request = row.get(self._col_request, "")
+            movement = self._parse_request(str(raw_request))
             if not movement:
                 continue
 
-            # Campo principal: "numero" — identificador único do cenário/venda
+            # Injeta o status HTTP no dicionário do movimento
+            # usando chave privada "_http_status" para não colidir com campos do JSON
+            movement["_http_status"] = http_status
+
+            # Indexa pelo campo "numero" do JSON
             numero = str(movement.get("numero", "")).strip()
             if numero and numero.lower() not in ("none", "nan", ""):
                 self._index_numero.setdefault(numero, []).append(movement)
 
-            # Campos alternativos presentes em alguns parceiros
+            # Índices alternativos
             for key, idx in [
                 ("numeroNFCe", self._index_nfce),
                 ("nfce",       self._index_nfce),
@@ -74,7 +144,7 @@ class AuditParser:
 
     def _parse_request(self, raw: str) -> Optional[dict]:
         """
-        Normaliza aspas duplas escapadas e tenta json.loads.
+        Normaliza aspas duplas escapadas ("") e tenta json.loads.
         Fallback: extrai campos via regex se o JSON estiver malformado.
         """
         normalized = raw.replace('""', '"').strip()
@@ -101,7 +171,6 @@ class AuditParser:
             "total":          r'"total"\s*:\s*([\d.]+)',
             "descuentoTotal": r'"descuentoTotal"\s*:\s*([\d.]+)',
             "cancelacion":    r'"cancelacion"\s*:\s*(true|false)',
-            "status":         r'"status"\s*:\s*(\d+)',
         }
         for key, pat in patterns.items():
             m = re.search(pat, text)
@@ -111,8 +180,6 @@ class AuditParser:
                     result[key] = float(val)
                 elif key == "cancelacion":
                     result[key] = val == "true"
-                elif key == "status":
-                    result[key] = int(val)
                 else:
                     result[key] = val
 
@@ -126,22 +193,15 @@ class AuditParser:
     # ------------------------------------------------------------------
 
     def get_by_numero(self, numero: str) -> list[dict]:
-        """
-        Busca principal: campo "numero" do JSON da API.
-        Esse é o identificador canônico do cenário de venda.
-        """
         return self._index_numero.get(str(numero).strip(), [])
 
     def get_by_nfce(self, numero_nfce: str) -> list[dict]:
-        """Busca pelo número da NFC-e."""
         return self._index_nfce.get(str(numero_nfce).strip(), [])
 
     def get_by_sat(self, numero_sat: str) -> list[dict]:
-        """Busca pelo número SAT."""
         return self._index_sat.get(str(numero_sat).strip(), [])
 
     def get_by_ecf(self, numero_ecf: str) -> list[dict]:
-        """Busca pelo número ECF/COO."""
         return self._index_ecf.get(str(numero_ecf).strip(), [])
 
     def get_any(self, numero: str) -> list[dict]:
@@ -157,8 +217,7 @@ class AuditParser:
 
     def get_by_eans(self, eans: list[str]) -> list[dict]:
         """
-        Fallback final: busca movimentos cujos detalles contenham
-        ao menos um EAN da lista fornecida.
+        Fallback final: movimentos cujos detalles contenham ao menos 1 EAN da lista.
         """
         results = []
         ean_set = set(eans)
