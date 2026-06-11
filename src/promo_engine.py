@@ -1,250 +1,240 @@
 """
-M4 — PromoEngine
-Motor de validação por tipo de promoção Scanntech.
-
-Tipos suportados:
-    LLEVAPAGA         — lotes × (trigger − paga) × preço_unit vs descuentoTotal
-    DESCUENTOVARIABLE — subtotal_promo × pct vs descuentoTotal; sem qtd mín → desconto = 0
-    PRECIOFIJO        — lotes × preco_fixo vs valor cobrado nos itens participantes
-    ADICIONALREGALO   — descuentoTotal > 0 quando presente no roteiro
-    ADICIONALDESCUENTO— descuento_item / preco_item ≈ pct_promo ± 2%
-    DESCUENTOFIJO     — descuentoTotal == valor_fixo ± R$0,05
+Módulo 4 — PromoEngine
+Responsabilidade: Motor de validação por tipo de promoção.
 """
 
-from __future__ import annotations
 import logging
-import math
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
 
-from .models import AuditMovement, CheckResult
-
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 TOLERANCE = 0.05  # R$ 0,05
-PCT_TOL   = 0.02  # 2% para ADICIONALDESCUENTO
+
+PAGAMENTO_MAP = {
+    "dinheiro": ["1", "01", "DIN", "CASH"],
+    "credito":  ["3", "03", "CRE", "CREDITO"],
+    "debito":   ["4", "04", "DEB", "DEBITO"],
+    "pix":      ["5", "05", "PIX"],
+}
+
+
+@dataclass
+class PromoResult:
+    ok: bool
+    detalhe: str = ""
 
 
 class PromoEngine:
-    """Dispatcher de validação por tipo de promoção."""
+    """Valida cada tipo de promoção Scanntech."""
 
-    # ── Dispatcher público ───────────────────────────────────────────────────
-    def validate(
-        self,
-        promo_type: str,
-        row_data: Dict[str, Any],
-        movement: AuditMovement,
-    ) -> CheckResult:
-        """
-        Valida a promoção e retorna CheckResult.
-        row_data — dados da linha do roteiro (dict com chaves normalizadas).
-        """
-        tipo = promo_type.upper().strip()
-        handler = {
+    # ------------------------------------------------------------------
+    # Dispatcher principal
+    # ------------------------------------------------------------------
+
+    def validate(self, tipo: str, movement: dict, roteiro_row: dict) -> PromoResult:
+        """Despacha para o validador correto conforme o tipo de promoção."""
+        tipo_upper = str(tipo).upper().strip()
+        dispatch = {
             "LLEVAPAGA":          self._llevapaga,
             "DESCUENTOVARIABLE":  self._descuento_variable,
             "PRECIOFIJO":         self._precio_fijo,
             "ADICIONALREGALO":    self._adicional_regalo,
             "ADICIONALDESCUENTO": self._adicional_descuento,
             "DESCUENTOFIJO":      self._descuento_fijo,
-        }.get(tipo)
+        }
+        fn = dispatch.get(tipo_upper)
+        if not fn:
+            return PromoResult(ok=False, detalhe=f"Tipo de promoção desconhecido: {tipo}")
+        return fn(movement, roteiro_row)
 
-        if handler is None:
-            return CheckResult(
-                check="promo",
-                ok=True,
-                detalhe=f"Tipo '{promo_type}' não mapeado — check ignorado.",
-            )
+    # ------------------------------------------------------------------
+    # Validadores por tipo
+    # ------------------------------------------------------------------
 
+    def _llevapaga(self, mov: dict, row: dict) -> PromoResult:
+        """Leva X Paga Y: lotes × (trigger − paga) × preço_unit ≈ descuentoTotal."""
         try:
-            return handler(row_data, movement)
-        except Exception as exc:
-            log.error("PromoEngine erro em %s: %s", tipo, exc, exc_info=True)
-            return CheckResult(check="promo", ok=False, detalhe=f"Erro interno: {exc}")
+            qtd        = float(row.get("qtd", 0))
+            trigger    = float(row.get("trigger", 0))
+            paga       = float(row.get("paga", trigger))
+            preco_unit = float(row.get("preco_unit", 0))
+            descuento  = float(mov.get("descuentoTotal", 0))
 
-    # ── LLEVAPAGA ────────────────────────────────────────────────────────────
-    def _llevapaga(
-        self, row: Dict[str, Any], mv: AuditMovement
-    ) -> CheckResult:
-        """
-        Calcula: lotes × (trigger − paga) × preço_unit.
-        Campos esperados no roteiro: qtd, trigger, paga, preco_unit.
-        """
-        qtd        = _safe_float(row.get("qtd"))
-        trigger    = _safe_float(row.get("trigger")  or row.get("leva"))
-        paga       = _safe_float(row.get("paga")     or row.get("pagando"))
-        preco_unit = _safe_float(row.get("preco_unit") or row.get("valor_unit"))
+            if trigger <= 0:
+                return PromoResult(ok=False, detalhe="trigger inválido para LLEVAPAGA")
 
-        if None in (qtd, trigger, paga, preco_unit) or trigger == 0:
-            return CheckResult(check="promo", ok=False, detalhe="Dados insuficientes para LLEVAPAGA.")
-
-        lotes          = math.floor(qtd / trigger)  # type: ignore[arg-type]
-        desconto_calc  = lotes * (trigger - paga) * preco_unit  # type: ignore[operator]
-        desconto_audit = mv.descuento_total or 0.0
-
-        ok = abs(desconto_calc - desconto_audit) <= TOLERANCE
-        return CheckResult(
-            check="promo",
-            ok=ok,
-            detalhe=(
-                f"LLEVAPAGA: calc={desconto_calc:.2f} audit={desconto_audit:.2f} "
-                f"(lotes={lotes}, trigger={trigger}, paga={paga})"
-            ),
-        )
-
-    # ── DESCUENTOVARIABLE ────────────────────────────────────────────────────
-    def _descuento_variable(
-        self, row: Dict[str, Any], mv: AuditMovement
-    ) -> CheckResult:
-        """
-        subtotal_promo × pct vs descuentoTotal.
-        Se qtd mínima não atingida → desconto deve ser zero.
-        """
-        subtotal_promo = _safe_float(row.get("subtotal_promo") or row.get("subtotal"))
-        pct            = _safe_float(row.get("pct")  or row.get("percentual"))
-        qtd            = _safe_float(row.get("qtd"))
-        qtd_min        = _safe_float(row.get("qtd_min") or row.get("minimo"))
-        desconto_audit = mv.descuento_total or 0.0
-
-        # Sem qtd mínima atingida → desconto deve ser zero
-        if qtd is not None and qtd_min is not None and qtd < qtd_min:
-            ok = abs(desconto_audit) <= TOLERANCE
-            return CheckResult(
-                check="promo",
+            lotes    = int(qtd // trigger)
+            esperado = lotes * (trigger - paga) * preco_unit
+            diff     = abs(esperado - descuento)
+            ok       = diff <= TOLERANCE
+            return PromoResult(
                 ok=ok,
-                detalhe=f"DESCUENTOVARIABLE: qtd={qtd} < min={qtd_min} → desconto esperado=0, audit={desconto_audit:.2f}",
+                detalhe="" if ok else (
+                    f"LLEVAPAGA: esperado R${esperado:.2f} "
+                    f"descuentoTotal={descuento:.2f} diff={diff:.2f}"
+                ),
             )
+        except (TypeError, ValueError) as e:
+            return PromoResult(ok=False, detalhe=f"LLEVAPAGA erro: {e}")
 
-        if None in (subtotal_promo, pct):
-            return CheckResult(check="promo", ok=False, detalhe="Dados insuficientes para DESCUENTOVARIABLE.")
+    def _descuento_variable(self, mov: dict, row: dict) -> PromoResult:
+        """Descuento Variable: subtotal_promo × pct ≈ descuentoTotal."""
+        try:
+            pct      = float(row.get("pct_promo", 0)) / 100
+            subtotal = float(row.get("subtotal_promo", 0))
+            descuento= float(mov.get("descuentoTotal", 0))
+            qtd_min  = float(row.get("qtd_min", 0))
 
-        desconto_calc = subtotal_promo * (pct / 100.0)  # type: ignore[operator]
-        ok = abs(desconto_calc - desconto_audit) <= TOLERANCE
-        return CheckResult(
-            check="promo",
-            ok=ok,
-            detalhe=(
-                f"DESCUENTOVARIABLE: calc={desconto_calc:.2f} audit={desconto_audit:.2f} "
-                f"(subtotal={subtotal_promo}, pct={pct}%)"
-            ),
-        )
-
-    # ── PRECIOFIJO ───────────────────────────────────────────────────────────
-    def _precio_fijo(
-        self, row: Dict[str, Any], mv: AuditMovement
-    ) -> CheckResult:
-        """
-        lotes × preco_fixo deve ser igual ao valor cobrado nos itens participantes.
-        """
-        qtd        = _safe_float(row.get("qtd"))
-        preco_fixo = _safe_float(row.get("preco_fixo") or row.get("valor_fixo"))
-        ean_promo  = str(row.get("ean") or row.get("ean_promo") or "").strip()
-
-        if None in (qtd, preco_fixo):
-            return CheckResult(check="promo", ok=False, detalhe="Dados insuficientes para PRECIOFIJO.")
-
-        # Soma itens participantes nos detalles
-        valor_cobrado = self._sum_item_value(mv.detalles, ean_promo)
-        esperado      = qtd * preco_fixo  # type: ignore[operator]
-
-        ok = abs(esperado - valor_cobrado) <= TOLERANCE
-        return CheckResult(
-            check="promo",
-            ok=ok,
-            detalhe=(
-                f"PRECIOFIJO: esperado={esperado:.2f} cobrado={valor_cobrado:.2f} "
-                f"(qtd={qtd}, preco={preco_fixo}, ean={ean_promo})"
-            ),
-        )
-
-    # ── ADICIONALREGALO ──────────────────────────────────────────────────────
-    def _adicional_regalo(
-        self, row: Dict[str, Any], mv: AuditMovement
-    ) -> CheckResult:
-        """descuentoTotal > 0 quando presente no roteiro."""
-        presente       = str(row.get("presente") or row.get("regalo") or "").lower()
-        desconto_audit = mv.descuento_total or 0.0
-
-        if "sim" in presente or "yes" in presente or "s" == presente:
-            ok = desconto_audit > 0
-            return CheckResult(
-                check="promo",
-                ok=ok,
-                detalhe=f"ADICIONALREGALO: presente esperado, descuentoTotal={desconto_audit:.2f}",
-            )
-        return CheckResult(check="promo", ok=True, detalhe="ADICIONALREGALO: sem presente esperado.")
-
-    # ── ADICIONALDESCUENTO ───────────────────────────────────────────────────
-    def _adicional_descuento(
-        self, row: Dict[str, Any], mv: AuditMovement
-    ) -> CheckResult:
-        """descuento_item / preco_item deve ≈ pct_promo ± 2%."""
-        pct_promo = _safe_float(row.get("pct") or row.get("percentual"))
-        ean_promo = str(row.get("ean") or row.get("ean_promo") or "").strip()
-
-        if pct_promo is None:
-            return CheckResult(check="promo", ok=False, detalhe="Dados insuficientes para ADICIONALDESCUENTO.")
-
-        for item in mv.detalles:
-            ean_item    = str(item.get("codigoBarras") or item.get("ean") or "").strip()
-            if ean_promo and ean_item != ean_promo:
-                continue
-            preco_item  = _safe_float(item.get("precioUnitario") or item.get("precio"))
-            desc_item   = _safe_float(item.get("descuento") or item.get("descuentoItem"))
-            if preco_item and desc_item is not None and preco_item > 0:
-                pct_real = (desc_item / preco_item) * 100.0
-                ok = abs(pct_real - pct_promo) <= PCT_TOL * 100
-                return CheckResult(
-                    check="promo",
+            if qtd_min == 0 or subtotal == 0:
+                ok = abs(descuento) <= TOLERANCE
+                return PromoResult(
                     ok=ok,
-                    detalhe=(
-                        f"ADICIONALDESCUENTO: pct_real={pct_real:.2f}% pct_esperado={pct_promo:.2f}% "
-                        f"ean={ean_item}"
-                    ),
+                    detalhe="" if ok else "DESCUENTOVARIABLE: sem qtd mínima, desconto deve ser zero"
                 )
 
-        return CheckResult(
-            check="promo",
-            ok=False,
-            detalhe=f"ADICIONALDESCUENTO: item EAN={ean_promo} não encontrado nos detalles.",
-        )
+            esperado = subtotal * pct
+            diff     = abs(esperado - descuento)
+            ok       = diff <= TOLERANCE
+            return PromoResult(
+                ok=ok,
+                detalhe="" if ok else (
+                    f"DESCUENTOVARIABLE: esperado R${esperado:.2f} "
+                    f"descuentoTotal={descuento:.2f}"
+                ),
+            )
+        except (TypeError, ValueError) as e:
+            return PromoResult(ok=False, detalhe=f"DESCUENTOVARIABLE erro: {e}")
 
-    # ── DESCUENTOFIJO ────────────────────────────────────────────────────────
-    def _descuento_fijo(
-        self, row: Dict[str, Any], mv: AuditMovement
-    ) -> CheckResult:
-        """descuentoTotal deve bater com valor fixo da promoção ± R$0,05."""
-        valor_fixo     = _safe_float(row.get("valor_desconto") or row.get("desconto_fixo"))
-        desconto_audit = mv.descuento_total or 0.0
+    def _precio_fijo(self, mov: dict, row: dict) -> PromoResult:
+        """Precio Fijo: lotes × preco_fixo ≈ valor cobrado nos itens participantes."""
+        try:
+            qtd        = float(row.get("qtd", 0))
+            trigger    = float(row.get("trigger", 1))
+            preco_fixo = float(row.get("preco_fixo", 0))
+            lotes      = int(qtd // trigger)
+            esperado   = lotes * preco_fixo
 
-        if valor_fixo is None:
-            return CheckResult(check="promo", ok=False, detalhe="Dados insuficientes para DESCUENTOFIJO.")
+            cobrado = sum(
+                float(d.get("valorCobrado", d.get("total", 0)))
+                for d in mov.get("detalles", [])
+                if d.get("participante", False)
+            )
+            diff = abs(esperado - cobrado)
+            ok   = diff <= TOLERANCE
+            return PromoResult(
+                ok=ok,
+                detalhe="" if ok else (
+                    f"PRECIOFIJO: esperado R${esperado:.2f} cobrado={cobrado:.2f}"
+                ),
+            )
+        except (TypeError, ValueError) as e:
+            return PromoResult(ok=False, detalhe=f"PRECIOFIJO erro: {e}")
 
-        ok = abs(valor_fixo - desconto_audit) <= TOLERANCE
-        return CheckResult(
-            check="promo",
-            ok=ok,
-            detalhe=f"DESCUENTOFIJO: esperado={valor_fixo:.2f} audit={desconto_audit:.2f}",
-        )
+    def _adicional_regalo(self, mov: dict, row: dict) -> PromoResult:
+        """Adicional Regalo: descuentoTotal deve ser > 0 se presente no roteiro."""
+        presente  = str(row.get("presente_esperado", "")).strip().lower()
+        descuento = float(mov.get("descuentoTotal", 0))
+        if presente in ("sim", "yes", "1", "true"):
+            ok = descuento > 0
+            return PromoResult(
+                ok=ok,
+                detalhe="" if ok else "ADICIONALREGALO: presente esperado mas descuentoTotal=0",
+            )
+        return PromoResult(ok=True)
 
-    # ── Helpers ──────────────────────────────────────────────────────────────
-    @staticmethod
-    def _sum_item_value(detalles: List[Dict], ean: str) -> float:
-        """Soma o valor cobrado dos itens pelo EAN (vazio = todos)."""
-        total = 0.0
-        for item in detalles:
-            if ean:
-                item_ean = str(item.get("codigoBarras") or item.get("ean") or "").strip()
-                if item_ean != ean:
+    def _adicional_descuento(self, mov: dict, row: dict) -> PromoResult:
+        """Adicional Descuento: descuento_item / preco_item ≈ pct_promo ± 2%."""
+        try:
+            pct_esperado = float(row.get("pct_promo", 0)) / 100
+            detalhes     = mov.get("detalles", [])
+            resultados   = []
+            for d in detalhes:
+                preco = float(d.get("precio", d.get("preco", 0)))
+                desc  = float(d.get("descuento", 0))
+                if preco == 0:
                     continue
-            qtd   = _safe_float(item.get("cantidad") or item.get("qtd") or 1) or 1.0
-            preco = _safe_float(item.get("precioUnitario") or item.get("precio") or 0)
-            total += qtd * (preco or 0.0)
-        return total
+                pct_real = desc / preco
+                resultados.append(abs(pct_real - pct_esperado) <= 0.02)
 
+            if not resultados:
+                return PromoResult(ok=False, detalhe="ADICIONALDESCUENTO: sem itens para calcular")
 
-# ── Utilitário ────────────────────────────────────────────────────────────────
-def _safe_float(val: Any) -> Optional[float]:
-    try:
-        return float(val)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return None
+            ok = all(resultados)
+            return PromoResult(
+                ok=ok,
+                detalhe="" if ok else (
+                    f"ADICIONALDESCUENTO: pct esperado={pct_esperado*100:.1f}% — divergência encontrada"
+                ),
+            )
+        except (TypeError, ValueError) as e:
+            return PromoResult(ok=False, detalhe=f"ADICIONALDESCUENTO erro: {e}")
+
+    def _descuento_fijo(self, mov: dict, row: dict) -> PromoResult:
+        """Descuento Fijo: descuentoTotal deve bater com valor fixo da promoção."""
+        try:
+            valor_fixo = float(row.get("valor_fixo", 0))
+            descuento  = float(mov.get("descuentoTotal", 0))
+            diff       = abs(valor_fixo - descuento)
+            ok         = diff <= TOLERANCE
+            return PromoResult(
+                ok=ok,
+                detalhe="" if ok else (
+                    f"DESCUENTOFIJO: esperado R${valor_fixo:.2f} "
+                    f"descuentoTotal={descuento:.2f}"
+                ),
+            )
+        except (TypeError, ValueError) as e:
+            return PromoResult(ok=False, detalhe=f"DESCUENTOFIJO erro: {e}")
+
+    # ------------------------------------------------------------------
+    # Validações auxiliares
+    # ------------------------------------------------------------------
+
+    def validate_pagamento(self, movimento_tipo: str, roteiro_tipo: str) -> PromoResult:
+        """Valida meio de pagamento via mapeamento codigoTipoPago."""
+        roteiro_norm = roteiro_tipo.lower().strip()
+        for label, codigos in PAGAMENTO_MAP.items():
+            if roteiro_norm in label or label in roteiro_norm:
+                ok = str(movimento_tipo).upper() in [c.upper() for c in codigos]
+                return PromoResult(
+                    ok=ok,
+                    detalhe="" if ok else (
+                        f"Pagamento: esperado {label} (códigos {codigos}), "
+                        f"recebido {movimento_tipo}"
+                    ),
+                )
+        return PromoResult(ok=False, detalhe=f"Tipo pagamento não mapeado: {roteiro_tipo}")
+
+    def validate_bin(self, movement: dict, bin_esperado: str) -> PromoResult:
+        """Valida presença do BIN específico no campo bin do JSON."""
+        bin_mov = str(movement.get("bin", "")).strip()
+        ok      = bin_esperado.strip() in bin_mov
+        return PromoResult(
+            ok=ok,
+            detalhe="" if ok else f"BIN esperado {bin_esperado}, encontrado {bin_mov}",
+        )
+
+    def validate_schema(self, movement: dict) -> PromoResult:
+        """Valida campos obrigatórios: total, numero, detalles, pagos."""
+        campos   = ["total", "numero", "detalles", "pagos"]
+        faltando = [c for c in campos if c not in movement]
+        ok       = len(faltando) == 0
+        return PromoResult(
+            ok=ok,
+            detalhe="" if ok else f"Schema: campos ausentes {faltando}",
+        )
+
+    def validate_desconto_manual(
+        self, movement: dict, obs: str, promo_ativa: bool
+    ) -> PromoResult:
+        """Rejeita desconto manual quando promoção Scanntech está ativa e obs='sem desconto manual'."""
+        if not promo_ativa:
+            return PromoResult(ok=True)
+        if "sem desconto manual" in str(obs).lower():
+            descuento = float(movement.get("descuentoManual", 0))
+            ok        = abs(descuento) <= TOLERANCE
+            return PromoResult(
+                ok=ok,
+                detalhe="" if ok else f"Desconto manual indevido: R${descuento:.2f}",
+            )
+        return PromoResult(ok=True)
