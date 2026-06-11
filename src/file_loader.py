@@ -1,29 +1,22 @@
 """
-M1 — FileLoader
-Valida existência e carrega todos os artefatos necessários:
-  - Roteiro XLSX (openpyxl, data_only=True)
-  - Export Audit XLSX (pandas)
-  - PDF de cupons (pdfplumber — retorna lista de páginas)
-  - JSONs avulsos opcionais (diretório)
+Módulo 1 — FileLoader
+Responsabilidade: Valida existência e carrega todos os artefatos necessários
+(TEMPLATE xlsx, Export Audit xlsx, PDF de cupons, diretório JSON opcional).
 """
 
-from __future__ import annotations
-import glob
-import json
 import logging
-import os
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Optional
 
 import pandas as pd
+import openpyxl
 import pdfplumber
-from openpyxl import load_workbook
-from openpyxl.workbook import Workbook
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class FileLoader:
-    """Valida existência e carrega todos os artefatos de entrada."""
+    """Valida e carrega os artefatos de entrada do validador QA."""
 
     def __init__(
         self,
@@ -31,73 +24,91 @@ class FileLoader:
         audit_path: str,
         pdf_path: str,
         json_dir: Optional[str] = None,
-    ) -> None:
-        self.roteiro_path = roteiro_path
-        self.audit_path   = audit_path
-        self.pdf_path     = pdf_path
-        self.json_dir     = json_dir
+    ):
+        self.roteiro_path = Path(roteiro_path)
+        self.audit_path = Path(audit_path)
+        self.pdf_path = Path(pdf_path)
+        self.json_dir = Path(json_dir) if json_dir else None
 
-    # ── Validação ────────────────────────────────────────────────────────────
-    def validate(self) -> None:
-        """Levanta FileNotFoundError se algum arquivo obrigatório não existir."""
-        for path in (self.roteiro_path, self.audit_path, self.pdf_path):
-            if not os.path.isfile(path):
-                raise FileNotFoundError(f"Arquivo não encontrado: {path}")
-        if self.json_dir and not os.path.isdir(self.json_dir):
-            raise FileNotFoundError(f"Diretório JSON não encontrado: {self.json_dir}")
-        log.info("Todos os artefatos obrigatórios encontrados.")
+    # ------------------------------------------------------------------
+    # Validação de existência
+    # ------------------------------------------------------------------
 
-    # ── Carga ────────────────────────────────────────────────────────────────
-    def load(
-        self,
-    ) -> Tuple[Workbook, pd.DataFrame, List[Any], List[Dict]]:
-        """
-        Returns:
-            wb_roteiro   — Workbook openpyxl (data_only=True)
-            df_audit     — DataFrame com a aba AUDIT_TICKETS
-            pdf_pages    — lista de objetos pdfplumber.Page
-            extra_jsons  — lista de dicts dos JSONs avulsos (pode ser [])
-        """
-        wb        = self._load_roteiro()
-        df_audit  = self._load_audit()
-        pdf_pages = self._load_pdf()
-        jsons     = self._load_jsons()
-        return wb, df_audit, pdf_pages, jsons
+    def validate_paths(self) -> None:
+        """Lança FileNotFoundError se qualquer artefato obrigatório não existir."""
+        required = [
+            (self.roteiro_path, "Roteiro (TEMPLATE xlsx)"),
+            (self.audit_path, "Export Audit xlsx"),
+            (self.pdf_path, "PDF de cupons"),
+        ]
+        for path, label in required:
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"{label} não encontrado: {path}"
+                )
+            logger.info("Artefato validado: %s → %s", label, path)
 
-    def _load_roteiro(self) -> Workbook:
-        log.info("Carregando roteiro: %s", self.roteiro_path)
-        wb = load_workbook(self.roteiro_path, data_only=True)
+        if self.json_dir and not self.json_dir.exists():
+            raise FileNotFoundError(
+                f"Diretório JSON não encontrado: {self.json_dir}"
+            )
+
+    # ------------------------------------------------------------------
+    # Carregamento
+    # ------------------------------------------------------------------
+
+    def load_roteiro(self) -> openpyxl.Workbook:
+        """Carrega o TEMPLATE xlsx em modo data_only=True."""
+        logger.info("Carregando roteiro: %s", self.roteiro_path)
+        wb = openpyxl.load_workbook(self.roteiro_path, data_only=True)
         return wb
 
-    def _load_audit(self) -> pd.DataFrame:
-        log.info("Carregando Audit: %s", self.audit_path)
+    def load_audit(self) -> pd.DataFrame:
+        """Carrega o export Audit como DataFrame (aba AUDIT_TICKETS)."""
+        logger.info("Carregando audit: %s", self.audit_path)
         try:
             df = pd.read_excel(self.audit_path, sheet_name="AUDIT_TICKETS")
         except Exception:
-            # Fallback: primeira aba
-            log.warning("Aba AUDIT_TICKETS não encontrada; usando primeira aba.")
-            df = pd.read_excel(self.audit_path)
-        log.info("  %d linhas no Audit.", len(df))
+            logger.warning(
+                "Aba AUDIT_TICKETS não encontrada — lendo primeira aba."
+            )
+            df = pd.read_excel(self.audit_path, sheet_name=0)
+        logger.info("Audit carregado: %d linhas", len(df))
         return df
 
-    def _load_pdf(self) -> List[Any]:
-        log.info("Abrindo PDF: %s", self.pdf_path)
-        pdf = pdfplumber.open(self.pdf_path)
-        pages = pdf.pages
-        log.info("  %d páginas no PDF.", len(pages))
+    def load_pdf_text_blocks(self) -> list[str]:
+        """Extrai texto bruto do PDF e retorna lista de páginas."""
+        logger.info("Carregando PDF: %s", self.pdf_path)
+        pages: list[str] = []
+        with pdfplumber.open(self.pdf_path) as pdf:
+            for i, page in enumerate(pdf.pages):
+                text = page.extract_text() or ""
+                pages.append(text)
+                logger.debug("Página %d: %d chars", i + 1, len(text))
+        logger.info("PDF carregado: %d páginas", len(pages))
         return pages
 
-    def _load_jsons(self) -> List[Dict]:
+    def list_json_files(self) -> list[Path]:
+        """Lista arquivos JSON no diretório opcional."""
         if not self.json_dir:
             return []
-        pattern = os.path.join(self.json_dir, "*.json")
-        files   = sorted(glob.glob(pattern))
-        result  = []
-        for fp in files:
-            try:
-                with open(fp, encoding="utf-8") as fh:
-                    result.append(json.load(fh))
-            except Exception as exc:
-                log.warning("Erro ao ler JSON %s: %s", fp, exc)
-        log.info("  %d JSONs avulsos carregados de %s.", len(result), self.json_dir)
-        return result
+        files = sorted(self.json_dir.glob("*.json"))
+        logger.info("JSON dir: %d arquivos encontrados", len(files))
+        return files
+
+    # ------------------------------------------------------------------
+    # Utilitário
+    # ------------------------------------------------------------------
+
+    def load_all(self) -> dict:
+        """
+        Valida e carrega todos os artefatos de uma vez.
+        Retorna dict com chaves: workbook, audit_df, pdf_pages, json_files.
+        """
+        self.validate_paths()
+        return {
+            "workbook":   self.load_roteiro(),
+            "audit_df":   self.load_audit(),
+            "pdf_pages":  self.load_pdf_text_blocks(),
+            "json_files": self.list_json_files(),
+        }
