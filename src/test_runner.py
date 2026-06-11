@@ -2,12 +2,26 @@
 Módulo 5 — TestRunner
 Responsabilidade: Orquestra a validação linha a linha do roteiro.
 
-Fix v2:
-  - Busca flexível do número do cupom: tenta múltiplos nomes de coluna
-    (numero_cupom, n° cupom, cupom, numero, nº cupom, sat, ecf, nfce, coo)
-    para ser resistente a variações de layout do TEMPLATE.
-  - Busca flexível de EANs: aceita colunas ean, eans, codigo_barras, cod_barra.
-  - Busca flexível de total, desconto, meio_pagamento, observacao.
+Estratégia de localização do cupom (Check 1)
+============================================
+Fonte 1 — campo "numero" do JSON da API (coluna do roteiro):
+  O roteiro deve conter uma coluna com o número do cenário de venda.
+  Esse número é o campo "numero" presente no JSON enviado à API Scanntech
+  e também impresso nos cupons fiscais físicos.
+  Aliases aceitos na planilha: numero_cupom, n° cupom, nº cupom, cupom,
+  numero, n cupom, num cupom, número cupom, n.cupom, num.cupom.
+
+Fonte 2 — número físico do cupom impresso (SAT / NFC-e / ECF):
+  Se a coluna acima não estiver preenchida, ou o número não for encontrado,
+  o mesmo valor é pesquisado nos índices SAT, NFC-e e ECF do PDF.
+
+Fonte 3 — nome do arquivo PDF:
+  O CouponPDFParser aceita o nome do arquivo na construção e extrai o
+  número do cupom do padrão  <numero>_resto.pdf  ou  cupom_<numero>.pdf.
+
+Fonte 4 (fallback final) — EANs:
+  Caso nenhuma das fontes acima localize o cupom, a busca é feita pelos
+  EANs dos itens da venda (coluna ean/eans/codigo_barras na planilha).
 """
 
 import logging
@@ -22,11 +36,11 @@ logger = logging.getLogger(__name__)
 
 TOLERANCE = 0.05
 
-# Aliases aceitos para cada campo do roteiro
+# Aliases de colunas do roteiro
 _ALIAS_NUMERO = [
     "numero_cupom", "n° cupom", "nº cupom", "cupom", "numero",
-    "sat", "ecf", "nfce", "coo", "n cupom", "num cupom",
-    "número cupom", "n.cupom", "num.cupom",
+    "n cupom", "num cupom", "número cupom", "n.cupom", "num.cupom",
+    "número",
 ]
 _ALIAS_EANS   = ["ean", "eans", "codigo_barras", "cod_barra", "codigo barras", "ean/upc"]
 _ALIAS_TOTAL  = ["total", "valor total", "vl total", "vl. total", "total venda"]
@@ -46,6 +60,12 @@ def _get(row: dict, aliases: list, default=None):
         if val is not None:
             return val
     return default
+
+
+def _clean_numero(raw) -> str:
+    """Normaliza o número do cupom: remove espaços, None, nan textuais."""
+    s = str(raw).strip() if raw is not None else ""
+    return "" if s.lower() in ("none", "nan", "") else s
 
 
 @dataclass
@@ -75,7 +95,7 @@ class TestResult:
 
 
 class TestRunner:
-    """Executa os 10 checks em sequência para cada linha do roteiro."""
+    """Executa os checks em sequência para cada linha do roteiro."""
 
     def __init__(
         self,
@@ -87,19 +107,88 @@ class TestRunner:
         self.pdf   = pdf
         self.promo = promo
 
+    # ------------------------------------------------------------------
+    # Localização do cupom — lógica centralizada
+    # ------------------------------------------------------------------
+
+    def _locate_coupon(
+        self, numero: str, eans: list[str]
+    ) -> tuple[Optional[Coupon], list[dict], str]:
+        """
+        Retorna (coupon_pdf, movimentos_audit, numero_resolvido).
+
+        Ordem de tentativas:
+          1. campo "numero" do JSON → busca direta em audit e pdf
+          2. mesmo valor buscado nos índices SAT / NFC-e / ECF do PDF
+          3. nome do arquivo PDF (delegado ao CouponPDFParser)
+          4. EANs como fallback final
+        """
+        coupon: Optional[Coupon] = None
+        movements: list[dict] = []
+        resolved: str = numero
+
+        if numero:
+            # --- Fonte 1: campo "numero" do JSON ---
+            movements = self.audit.get_by_numero(numero)
+            coupon    = self.pdf.get_by_numero(numero)  # tenta todos os sub-índices
+
+            if coupon:
+                logger.debug("Cupom localizado via numero='%s' no PDF", numero)
+            if movements:
+                logger.debug("Cupom localizado via numero='%s' no Audit (%d mov)",
+                             numero, len(movements))
+
+            # --- Fonte 2: tenta outros índices do Audit (nfce/sat/ecf) ---
+            if not movements:
+                movements = self.audit.get_by_nfce(numero)
+                if movements:
+                    logger.debug("Cupom localizado via NFC-e='%s' no Audit", numero)
+            if not movements:
+                movements = self.audit.get_by_sat(numero)
+                if movements:
+                    logger.debug("Cupom localizado via SAT='%s' no Audit", numero)
+            if not movements:
+                movements = self.audit.get_by_ecf(numero)
+                if movements:
+                    logger.debug("Cupom localizado via ECF='%s' no Audit", numero)
+
+        # --- Fonte 3: nome do arquivo ---
+        if not coupon and self.pdf.pdf_filename:
+            coupon = self.pdf.get_by_filename(self.pdf.pdf_filename)
+            if coupon:
+                resolved = coupon.get_numero() or numero
+                logger.debug("Cupom localizado via nome do arquivo: %s", self.pdf.pdf_filename)
+
+        # --- Fonte 4: fallback por EANs ---
+        if not coupon and eans:
+            coupon = self.pdf.get_by_eans(eans)
+            if coupon:
+                resolved = coupon.get_numero() or numero
+                logger.debug("Cupom localizado via EANs: %s", eans)
+
+        if not movements and eans:
+            movements = self.audit.get_by_eans(eans)
+            if movements:
+                logger.debug("Audit localizado via EANs: %s", eans)
+
+        # Sincroniza numero resolvido
+        if not resolved and coupon:
+            resolved = coupon.get_numero() or ""
+        if not resolved and movements:
+            resolved = str(movements[0].get("numero", ""))
+
+        return coupon, movements, resolved
+
+    # ------------------------------------------------------------------
+    # Execução principal
+    # ------------------------------------------------------------------
+
     def run(self, row: dict, linha: int) -> TestResult:
         etapa  = str(_get(row, _ALIAS_ETAPA, "") or "")
         result = TestResult(etapa=etapa, linha=linha, cupom_numero=None)
 
-        # --- Check 1: Cupom localizado ---
-        # Aceita múltiplos aliases para o número do cupom
-        numero_raw = _get(row, _ALIAS_NUMERO, "")
-        numero     = str(numero_raw).strip() if numero_raw is not None else ""
-        # Remove None/nan textual
-        if numero.lower() in ("none", "nan", ""):
-            numero = ""
-
-        # EANs: suporta string separada por vírgula ou valor único
+        # Coleta número e EANs do roteiro
+        numero = _clean_numero(_get(row, _ALIAS_NUMERO, ""))
         eans_raw = _get(row, _ALIAS_EANS, "")
         if isinstance(eans_raw, str):
             eans = [e.strip() for e in eans_raw.split(",") if e.strip()]
@@ -108,31 +197,17 @@ class TestRunner:
         else:
             eans = []
 
-        coupon: Optional[Coupon] = None
-        movements: list = []
-
-        if numero:
-            coupon    = self.pdf.get_by_numero(numero)
-            movements = self.audit.get_by_numero(numero)
-            logger.debug("Buscando cupom '%s': pdf=%s audit=%d",
-                         numero, coupon is not None, len(movements))
-
-        if not coupon and eans:
-            coupon = self.pdf.get_by_eans(eans)
-            logger.debug("Fallback EAN %s: pdf=%s", eans, coupon is not None)
-
-        if not movements and eans:
-            movements = self.audit.get_by_eans(eans)
-            logger.debug("Fallback EAN %s: audit=%d", eans, len(movements))
-
+        # --- Check 1: Cupom localizado ---
+        coupon, movements, resolved = self._locate_coupon(numero, eans)
         found = coupon is not None or len(movements) > 0
-        result.cupom_numero = (
-            coupon.get_numero() if coupon
-            else (movements[0].get("numero") if movements else None)
-        )
+        result.cupom_numero = resolved or None
+
         result.checks.append(CheckResult(
             "cupom_localizado", found,
-            "" if found else f"Cupom não localizado: '{numero}' (EANs={eans})"
+            "" if found else (
+                f"Cupom não localizado: numero='{numero}' EANs={eans} "
+                f"arquivo='{self.pdf.pdf_filename or 'N/A'}'"
+            )
         ))
         if not found:
             return result  # falha rápida
@@ -148,10 +223,10 @@ class TestRunner:
         ))
 
         # --- Check 3: Cancelamento ---
-        obs               = str(_get(row, _ALIAS_OBS, "") or "").lower()
-        cancelado_esperado= "cancelado" in obs or "cancelacion" in obs
-        cancelado_real    = bool(mov.get("cancelacion", False))
-        ok_cancel         = cancelado_esperado == cancelado_real
+        obs                = str(_get(row, _ALIAS_OBS, "") or "").lower()
+        cancelado_esperado = "cancelado" in obs or "cancelacion" in obs
+        cancelado_real     = bool(mov.get("cancelacion", False))
+        ok_cancel          = cancelado_esperado == cancelado_real
         result.checks.append(CheckResult(
             "cancelamento", ok_cancel,
             "" if ok_cancel else (
@@ -184,23 +259,24 @@ class TestRunner:
         # --- Check 6: Meio de pagamento ---
         tipo_pag_rot = str(_get(row, _ALIAS_PAGO, "") or "")
         tipo_pag_mov = str(mov.get("codigoTipoPago", ""))
-        res_pag = self.promo.validate_pagamento(tipo_pag_mov, tipo_pag_rot)
-        result.checks.append(CheckResult("pagamento", res_pag.ok, res_pag.detalhe))
+        if tipo_pag_rot:
+            res_pag = self.promo.validate_pagamento(tipo_pag_mov, tipo_pag_rot)
+            result.checks.append(CheckResult("pagamento", res_pag.ok, res_pag.detalhe))
 
         # --- Check 7: BIN ---
-        bin_esp = str(_get(row, ["bin"], "") or "").strip()
-        if bin_esp and bin_esp.lower() not in ("none", "nan"):
+        bin_esp = str(row.get("bin", "") or "").strip()
+        if bin_esp:
             res_bin = self.promo.validate_bin(mov, bin_esp)
             result.checks.append(CheckResult("bin", res_bin.ok, res_bin.detalhe))
 
-        # --- Check 8: Promoção + Check 9: Desconto manual ---
-        tipo_promo = str(_get(row, ["tipo_promo", "tipo promo", "promo", "promoção",
-                                    "promocao", "tipo promocao", "tipo promoção"], "") or "").strip()
-        if tipo_promo and tipo_promo.lower() not in ("none", "nan", "-", ""):
-            promo_ativa = bool(_get(row, ["promo_ativa", "promo ativa"], True))
+        # --- Check 8: Promoção ---
+        tipo_promo = str(row.get("tipo_promo", "") or "").strip()
+        if tipo_promo:
+            promo_ativa = bool(row.get("promo_ativa", True))
             res_promo   = self.promo.validate(tipo_promo, mov, row)
             result.checks.append(CheckResult("promocao", res_promo.ok, res_promo.detalhe))
 
+            # --- Check 9: Desconto manual indevido ---
             res_dm = self.promo.validate_desconto_manual(mov, obs, promo_ativa)
             result.checks.append(CheckResult("desconto_manual", res_dm.ok, res_dm.detalhe))
 
