@@ -1,6 +1,16 @@
 """
 Módulo 5 — TestRunner
 Responsabilidade: Orquestra a validação linha a linha do roteiro (10 checks).
+
+Colunas do roteiro que identificam o cupom:
+  F → "Numero de cupom"  (número genérico / fallback)
+  G → "SAT"              (número SAT fiscal)
+  H → "ECF"              (número ECF / COO)
+  H → "NFCE"             (número NFC-e)
+
+A lógica tenta, em ordem:
+  1. Qualquer valor não-nulo dentre SAT > NFCE > ECF > numero_cupom
+  2. Fallback por conjunto de EANs quando nenhum número está disponível
 """
 
 import logging
@@ -40,6 +50,35 @@ class TestResult:
         return ""
 
 
+def _get_cupom_numero(row: dict) -> Optional[str]:
+    """
+    Extrai o número identificador do cupom da linha do roteiro.
+
+    Tenta as colunas na seguinte prioridade:
+      1. sat          → coluna G  (SAT fiscal)
+      2. nfce / nfc-e → coluna H  (NFC-e)
+      3. ecf          → coluna H  (ECF/COO)
+      4. numero_cupom → coluna F  (genérico)
+      5. numero de cupom (variação com espaços)
+    """
+    # Chaves normalizadas que o orquestrador gera a partir do cabeçalho
+    candidates = [
+        row.get("sat"),
+        row.get("nfce"),
+        row.get("nfc-e"),
+        row.get("ecf"),
+        row.get("numero_cupom"),
+        row.get("numero de cupom"),
+        row.get("numero"),
+    ]
+    for val in candidates:
+        if val is not None:
+            s = str(val).strip()
+            if s and s.lower() not in ("", "none", "nan", "0"):
+                return s
+    return None
+
+
 class TestRunner:
     """
     Executa os 10 checks em sequência para cada linha do roteiro.
@@ -62,18 +101,23 @@ class TestRunner:
 
         # ----------------------------------------------------------------
         # Check 1 — Cupom localizado
+        # Prioridade: SAT > NFCE > ECF > numero_cupom  (colunas G, H, F)
+        # Fallback: busca por EANs
         # ----------------------------------------------------------------
-        numero = str(row.get("numero_cupom", "")).strip()
+        numero = _get_cupom_numero(row)
         eans   = [str(e).strip() for e in row.get("eans", []) if e]
 
         coupon:    Optional[Coupon] = None
         movements: list[dict]       = []
 
         if numero:
+            logger.debug("Linha %d: buscando cupom por número '%s'", linha, numero)
             coupon    = self.pdf.get_by_numero(numero)
             movements = self.audit.get_by_numero(numero)
 
+        # Fallback por EANs se não achou pelo número
         if not coupon and eans:
+            logger.debug("Linha %d: fallback por EANs %s", linha, eans)
             coupon = self.pdf.get_by_eans(eans)
 
         if not movements and eans:
@@ -84,6 +128,7 @@ class TestRunner:
             coupon.get_numero() if coupon
             else (movements[0].get("numero") if movements else None)
         )
+
         result.checks.append(CheckResult(
             "cupom_localizado", found,
             "" if found else f"Cupom não localizado: {numero or eans}"
@@ -96,8 +141,8 @@ class TestRunner:
         # ----------------------------------------------------------------
         # Check 2 — HTTP 200
         # ----------------------------------------------------------------
-        status   = int(mov.get("status", mov.get("httpStatus", 0)))
-        ok_http  = status == 200
+        status  = int(mov.get("status", mov.get("httpStatus", 0)))
+        ok_http = status == 200
         result.checks.append(CheckResult(
             "http_200", ok_http,
             "" if ok_http else f"Status HTTP: {status}"
