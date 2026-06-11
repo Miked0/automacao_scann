@@ -1,12 +1,6 @@
 """
 Módulo 2 — AuditParser
 Responsabilidade: Indexa movimentos do export Audit pelo nº cupom.
-
-Formato esperado do campo 'Request' no export:
-  JSON com aspas internas escapadas como ""
-  Ex: """numero"":""123"",""total"":36.55"
-  O parser normaliza via str.replace('""', '"') antes do json.loads.
-  Fallback regex extrai campos caso o JSON esteja malformado.
 """
 
 import json
@@ -49,9 +43,7 @@ class AuditParser:
         Normaliza aspas duplas escapadas e tenta json.loads.
         Fallback: extrai campos via regex se o JSON estiver malformado.
         """
-        # Normaliza "" → " (padrão de escape do export Audit)
         normalized = raw.replace('""', '"').strip()
-        # Remove wrapping de aspas externas se houver
         if normalized.startswith('"') and normalized.endswith('"'):
             normalized = normalized[1:-1]
 
@@ -62,7 +54,6 @@ class AuditParser:
         except json.JSONDecodeError:
             pass
 
-        # Fallback regex
         return self._regex_fallback(normalized)
 
     def _regex_fallback(self, text: str) -> Optional[dict]:
@@ -74,8 +65,6 @@ class AuditParser:
             "descuentoTotal":r'"descuentoTotal"\s*:\s*([\d.]+)',
             "cancelacion":   r'"cancelacion"\s*:\s*(true|false)',
             "status":        r'"status"\s*:\s*(\d+)',
-            "bin":           r'"bin"\s*:\s*"([^"]+)"',
-            "codigoTipoPago":r'"codigoTipoPago"\s*:\s*"([^"]+)"',
         }
         for key, pat in patterns.items():
             m = re.search(pat, text)
@@ -106,14 +95,12 @@ class AuditParser:
     def get_by_eans(self, eans: list) -> list:
         """
         Fallback: busca movimentos cujos detalles contenham ao menos um EAN da lista.
-        Útil quando o número do cupom não está disponível.
         """
         results = []
-        ean_set = set(eans)
         for movements in self._index.values():
             for mov in movements:
                 mov_eans = self._extract_eans(mov)
-                if any(e in mov_eans for e in ean_set):
+                if any(e in mov_eans for e in eans):
                     results.append(mov)
         return results
 

@@ -3,11 +3,6 @@
 scanntech_qa_validator.py
 Orquestrador principal do Scanntech QA Validator.
 
-Colunas do roteiro para identificação do cupom:
-  F → "Numero de cupom"  (número genérico)
-  G → "SAT"              (SAT fiscal)
-  H → "ECF" ou "NFCE"   (ECF/COO ou NFC-e)
-
 Uso:
     python scanntech_qa_validator.py \\
         --roteiro  "TEMPLATE_COM_BIN_NOVO.xlsx" \\
@@ -26,11 +21,11 @@ from src.audit_parser      import AuditParser
 from src.coupon_pdf_parser import CouponPDFParser
 from src.promo_engine      import PromoEngine
 from src.test_runner       import TestRunner
-from src.result_writer     import ResultWriter, build_row_dict, _detect_header_row
+from src.result_writer     import ResultWriter, KEYWORDS_HEADER
 from src.audit_logger      import AuditLogger
 
 # -------------------------------------------------------------------
-# Logging: console + arquivo simultâneos
+# Logging: arquivo + console simultâneos
 # -------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -56,11 +51,37 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _detect_header(wb) -> int:
+    ws = wb.active
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value and any(
+                kw in str(cell.value).lower() for kw in KEYWORDS_HEADER
+            ):
+                return cell.row
+    return 1
+
+
+def _extract_roteiro_rows(wb, header_row: int) -> list:
+    """Lê linhas do roteiro a partir da linha de cabeçalho."""
+    ws = wb.active
+    headers = [
+        str(cell.value).strip().lower() if cell.value else f"col_{cell.column}"
+        for cell in ws[header_row]
+    ]
+    rows = []
+    for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
+        if all(v is None for v in row):
+            continue
+        rows.append(dict(zip(headers, row)))
+    return rows
+
+
 def main() -> int:
     args = parse_args()
     logger.info("=== Scanntech QA Validator — início ===")
 
-    # 1. Carregamento e validação dos artefatos
+    # --- 1. Carregamento ---
     loader = FileLoader(
         roteiro_path=args.roteiro,
         audit_path=args.audit,
@@ -77,51 +98,42 @@ def main() -> int:
     audit_df  = artefatos["audit_df"]
     pdf_pages = artefatos["pdf_pages"]
 
-    # 2. Parsing dos artefatos
+    # --- 2. Parsing ---
     audit_parser = AuditParser(audit_df)
     pdf_parser   = CouponPDFParser(pdf_pages)
     promo_engine = PromoEngine()
 
-    # 3. Runner + Writer + Logger
+    # --- 3. Runner + Writer + Logger ---
     runner  = TestRunner(audit_parser, pdf_parser, promo_engine)
     writer  = ResultWriter(wb, args.output)
     alogger = AuditLogger(args.log)
 
-    ws         = wb.active
-    header_row = _detect_header_row(ws)
+    header_row = _detect_header(wb)
+    rows       = _extract_roteiro_rows(wb, header_row)
+    total      = len(rows)
+    logger.info("Roteiro: %d linhas de teste encontradas", total)
 
-    # Conta linhas de dados
-    data_rows = [
-        r for r in range(header_row + 1, ws.max_row + 1)
-        if any(ws.cell(row=r, column=c).value for c in range(1, ws.max_column + 1))
-    ]
-    total = len(data_rows)
-    logger.info("Roteiro: %d linhas de teste encontradas (cabeçalho na linha %d)",
-                total, header_row)
-
-    for idx, data_row in enumerate(data_rows, start=1):
-        # Monta dict da linha com chaves canônicas (sat, ecf, nfce, numero_cupom, ...)
-        row = build_row_dict(ws, header_row, data_row)
-
-        result = runner.run(row, linha=data_row)
+    for idx, row in enumerate(rows, start=1):
+        data_row = header_row + idx
+        result   = runner.run(row, linha=data_row)
         writer.write_result(result, data_row)
         alogger.record(result)
 
-        status_label = "✓" if result.passed else "✗"
+        status_label = "\u2713" if result.passed else "\u2717"
         logger.info(
             "[%d/%d] Linha %-3d %s  %s",
             idx, total, data_row, status_label,
-            f"({result.motivo_erro})" if not result.passed else "",
+            f"({result.motivo_erro})" if not result.passed else ""
         )
 
-    # 4. Persistência final
+    # --- 4. Persistência ---
     writer.save()
     alogger.flush()
 
     sumario = alogger.summary()
     logger.info(
         "=== Concluído: %d/%d passaram (%.1f%%) ===",
-        sumario["passou"], sumario["total"], sumario["pct_ok"],
+        sumario["passou"], sumario["total"], sumario["pct_ok"]
     )
     return 0
 

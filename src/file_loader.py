@@ -1,20 +1,6 @@
 """
 Módulo 1 — FileLoader
 Responsabilidade: Valida existência e carrega todos os artefatos.
-
-Planilhas suportadas:
-  - TEMPLATE_COM_BIN_NOVO.xlsx  (3 etapas, com validação BIN ELO)
-  - TEMPLATE_SEM_BIN_NOVO.xlsx  (3 etapas, sem BIN)
-
-Estrutura da aba de testes (cabeçalho detectado dinamicamente):
-  Teste | Tipo Promo | Items | Pagamento | Observacoes | SAT | ECF | NFCE |
-  Sub-Total | Desconto | Total | Json | Minoristas | Cupom | Observacoes
-
-Colunas de resultado (preenchidas pelo script):
-  Json        → Ok/Erro (verde/vermelho)
-  Minoristas  → Ok/Erro
-  Cupom       → Ok/Erro
-  Observacoes → justificativa ≤100 chars
 """
 
 import logging
@@ -39,20 +25,16 @@ class FileLoader:
         json_dir: Optional[str] = None,
     ):
         self.roteiro_path = Path(roteiro_path)
-        self.audit_path   = Path(audit_path)
-        self.pdf_path     = Path(pdf_path)
-        self.json_dir     = Path(json_dir) if json_dir else None
-
-    # ------------------------------------------------------------------
-    # Validação
-    # ------------------------------------------------------------------
+        self.audit_path = Path(audit_path)
+        self.pdf_path = Path(pdf_path)
+        self.json_dir = Path(json_dir) if json_dir else None
 
     def validate_paths(self) -> None:
         """Lança FileNotFoundError se qualquer artefato obrigatório não existir."""
         required = [
             (self.roteiro_path, "Roteiro (TEMPLATE xlsx)"),
-            (self.audit_path,   "Export Audit xlsx"),
-            (self.pdf_path,     "PDF de cupons"),
+            (self.audit_path, "Export Audit xlsx"),
+            (self.pdf_path, "PDF de cupons"),
         ]
         for path, label in required:
             if not path.exists():
@@ -62,27 +44,13 @@ class FileLoader:
         if self.json_dir and not self.json_dir.exists():
             raise FileNotFoundError(f"Diretório JSON não encontrado: {self.json_dir}")
 
-    # ------------------------------------------------------------------
-    # Carregamento
-    # ------------------------------------------------------------------
-
     def load_roteiro(self) -> openpyxl.Workbook:
-        """
-        Carrega o TEMPLATE xlsx em modo data_only=True.
-        Preserva valores calculados sem reavaliar fórmulas.
-        Compatível com TEMPLATE_COM_BIN_NOVO e TEMPLATE_SEM_BIN_NOVO.
-        """
+        """Carrega o TEMPLATE xlsx em modo data_only=True."""
         logger.info("Carregando roteiro: %s", self.roteiro_path)
-        wb = openpyxl.load_workbook(self.roteiro_path, data_only=True)
-        logger.info("Abas encontradas: %s", wb.sheetnames)
-        return wb
+        return openpyxl.load_workbook(self.roteiro_path, data_only=True)
 
     def load_audit(self) -> pd.DataFrame:
-        """
-        Carrega o export Audit como DataFrame.
-        Tenta a aba AUDIT_TICKETS; fallback para a primeira aba.
-        O campo 'Request' contém o JSON da venda com aspas escapadas como "".
-        """
+        """Carrega o export Audit como DataFrame (aba AUDIT_TICKETS)."""
         logger.info("Carregando audit: %s", self.audit_path)
         try:
             df = pd.read_excel(self.audit_path, sheet_name="AUDIT_TICKETS")
@@ -93,10 +61,7 @@ class FileLoader:
         return df
 
     def load_pdf_text_blocks(self) -> list:
-        """
-        Extrai texto bruto do PDF página a página.
-        O CouponPDFParser faz o split em blocos de cupom.
-        """
+        """Extrai texto bruto do PDF e retorna lista de páginas."""
         logger.info("Carregando PDF: %s", self.pdf_path)
         pages = []
         with pdfplumber.open(self.pdf_path) as pdf:

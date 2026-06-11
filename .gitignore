@@ -14,20 +14,20 @@ build/
 venv/
 env/
 
-# Saídas do validador
-TEMPLATE_PREENCHIDO*.xlsx
-qa_validation.log
+# Saídas geradas pelo validator
+*.log
 qa_audit_log.json
+TEMPLATE_PREENCHIDO*.xlsx
 
 # Artefatos de entrada (não versionar dados sensíveis)
-export_tickets_audit*.xlsx
-ilovepdf_merged*.pdf
+export_tickets_*.xlsx
+ilovepdf_*.pdf
+TEMPLATE_COM_BIN*.xlsx
 
 # IDEs
 .vscode/
 .idea/
 *.swp
-*.swo
 
 # macOS
 .DS_Store

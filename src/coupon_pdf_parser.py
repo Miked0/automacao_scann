@@ -1,16 +1,6 @@
 """
 Módulo 3 — CouponPDFParser
-Responsabilidade: Extrai cupons fiscais (DANFE / NFC-e / SAT) do PDF.
-
-Fluxo:
-  1. Recebe lista de textos brutos (uma string por página PDF)
-  2. Concatena e divide em blocos por padrão de cabeçalho de cupom
-     (NFC-e, SAT FISCAL, CUPOM FISCAL, DANFE, COO, NF-e)
-  3. Cada bloco é parseado para extrair:
-     - Número SAT / COO / NFC-e
-     - Subtotal, desconto, total
-     - Lista de EANs (13 e 8 dígitos)
-     - Formas de pagamento
+Responsabilidade: Extrai cupons fiscais (DANFE/NFC-e/SAT) do PDF.
 """
 
 import logging
@@ -20,7 +10,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Padrões que delimitam início de novo cupom no texto
+# Padrões que delimitam início de novo cupom
 _COUPON_HEADERS = re.compile(
     r"(NFC-e|SAT\s+FISCAL|CUPOM\s+FISCAL|DANFE|COO\s*[:=]\s*\d+|NF-e)",
     re.IGNORECASE,
@@ -29,42 +19,34 @@ _COUPON_HEADERS = re.compile(
 _RE_SUBTOTAL  = re.compile(r"(?:subtotal|sub[-\s]?total)\s*[:\-]?\s*([\d.,]+)", re.IGNORECASE)
 _RE_DESCONTO  = re.compile(r"(?:desconto|desc\.?)\s*[:\-]?\s*([\d.,]+)", re.IGNORECASE)
 _RE_TOTAL     = re.compile(r"(?:^|\s)total\s*[:\-]?\s*([\d.,]+)", re.IGNORECASE | re.MULTILINE)
-_RE_EAN13     = re.compile(r"\b(\d{13})\b")
-_RE_EAN8      = re.compile(r"\b(\d{8})\b")
+_RE_EAN       = re.compile(r"\b(\d{13})\b")
 _RE_COO       = re.compile(r"COO\s*[:\-=]?\s*(\d+)", re.IGNORECASE)
 _RE_SAT       = re.compile(r"SAT\s*[:\-=]?\s*(\d{6,})", re.IGNORECASE)
 _RE_NFCE      = re.compile(r"NFC-e\s*[:\-=]?\s*(\d+)", re.IGNORECASE)
 _RE_PAGAMENTO = re.compile(
-    r"(?:dinheiro|cart[aã]o\s+cr[eé]dito|cart[aã]o\s+d[eé]bito|pix|vale[-\s]?refeiç[aã]o)",
+    r"(?:dinheiro|cart[aã]o\s+cr[eé]dito|cart[aã]o\s+d[eé]bito|pix|vale[-\s]?refei[çc][aã]o)",
     re.IGNORECASE,
 )
 
 
 def _to_float(val: str) -> float:
-    """Converte string monetária BR (1.234,56 ou 1234.56) para float."""
-    val = val.strip()
-    if "," in val and "." in val:
-        # Formato BR: 1.234,56
-        val = val.replace(".", "").replace(",", ".")
-    elif "," in val:
-        val = val.replace(",", ".")
-    return float(val)
+    """Converte string monetária BR (1.234,56) para float."""
+    return float(val.replace(".", "").replace(",", "."))
 
 
 @dataclass
 class Coupon:
     raw_text: str
-    numero_sat:  Optional[str] = None
-    numero_coo:  Optional[str] = None
+    numero_sat: Optional[str] = None
+    numero_coo: Optional[str] = None
     numero_nfce: Optional[str] = None
-    subtotal:    Optional[float] = None
-    desconto:    Optional[float] = None
-    total:       Optional[float] = None
-    eans:        list = field(default_factory=list)
+    subtotal: Optional[float] = None
+    desconto: Optional[float] = None
+    total: Optional[float] = None
+    eans: list = field(default_factory=list)
     formas_pagamento: list = field(default_factory=list)
 
     def get_numero(self) -> Optional[str]:
-        """Retorna o identificador principal do cupom (SAT > NFC-e > COO)."""
         return self.numero_sat or self.numero_nfce or self.numero_coo
 
 
@@ -75,10 +57,6 @@ class CouponPDFParser:
         self.pdf_pages = pdf_pages
         self._coupons: list = []
         self._parse_all()
-
-    # ------------------------------------------------------------------
-    # Pipeline de parsing
-    # ------------------------------------------------------------------
 
     def _parse_all(self) -> None:
         full_text = "\n".join(self.pdf_pages)
@@ -93,7 +71,6 @@ class CouponPDFParser:
         """Divide o texto em blocos por padrão de cabeçalho de cupom."""
         positions = [m.start() for m in _COUPON_HEADERS.finditer(text)]
         if not positions:
-            # Sem cabeçalho reconhecido: trata o texto inteiro como um bloco
             return [text]
         blocks = []
         for i, start in enumerate(positions):
@@ -107,7 +84,6 @@ class CouponPDFParser:
             return None
         c = Coupon(raw_text=block)
 
-        # Números identificadores
         m = _RE_SAT.search(block)
         if m:
             c.numero_sat = m.group(1).strip()
@@ -120,7 +96,6 @@ class CouponPDFParser:
         if m:
             c.numero_nfce = m.group(1).strip()
 
-        # Valores monetários
         m = _RE_SUBTOTAL.search(block)
         if m:
             try:
@@ -135,7 +110,6 @@ class CouponPDFParser:
             except ValueError:
                 pass
 
-        # Pega o último match de total (evita falsos positivos)
         totals = _RE_TOTAL.findall(block)
         if totals:
             try:
@@ -143,22 +117,13 @@ class CouponPDFParser:
             except ValueError:
                 pass
 
-        # EANs: 13 dígitos primeiro, depois 8 dígitos (EAN-8)
-        eans13 = _RE_EAN13.findall(block)
-        eans8  = _RE_EAN8.findall(block)
-        c.eans = list(dict.fromkeys(eans13 + eans8))  # únicos, ordenados
-
-        # Formas de pagamento
+        c.eans = list(dict.fromkeys(_RE_EAN.findall(block)))
         c.formas_pagamento = list({
             m.group(0).lower()
             for m in _RE_PAGAMENTO.finditer(block)
         })
 
         return c
-
-    # ------------------------------------------------------------------
-    # Consultas
-    # ------------------------------------------------------------------
 
     def get_by_numero(self, numero: str) -> Optional[Coupon]:
         """Busca cupom por SAT, NFC-e ou COO."""
