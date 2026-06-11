@@ -1,119 +1,157 @@
 """
-M3 — CouponPDFParser
-Extrai cupons fiscais (DANFE/NFC-e/SAT) do PDF usando pdfplumber.
-
-Estratégia:
-  1. Extrai texto bruto de todas as páginas.
-  2. Divide em blocos pelo padrão de cabeçalho (NFC-e, SAT, COO).
-  3. Cada bloco é parseado via regex para: subtotal, desconto, total,
-     EANs e formas de pagamento.
+Módulo 3 — CouponPDFParser
+Responsabilidade: Extrai cupons fiscais (DANFE/NFC-e/SAT) do PDF.
 """
 
-from __future__ import annotations
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Optional
 
-from .models import CouponBlock
+logger = logging.getLogger(__name__)
 
-log = logging.getLogger(__name__)
-
-# ── Padrões de cabeçalho de cupom ────────────────────────────────────────────
-_BLOCK_HEADER = re.compile(
-    r"(?:NFC-?E|SAT|COO|CUPOM\s+FISCAL|DOCUMENTO\s+AUXILIAR)",
+# Padrões que delimitam início de novo cupom
+_COUPON_HEADERS = re.compile(
+    r"(NFC-e|SAT\s+FISCAL|CUPOM\s+FISCAL|DANFE|COO\s*[:=]\s*\d+|NF-e)",
     re.IGNORECASE,
 )
 
-# ── Padrões de campos ────────────────────────────────────────────────────────
-_SAT_RE    = re.compile(r"(?:SAT|Nº\s*SAT)[\s:]+([\d]+)",       re.IGNORECASE)
-_NFCE_RE   = re.compile(r"(?:NFC-?E|CHAVE)[\s:]+([\d]{44}|[\d]+)", re.IGNORECASE)
-_COO_RE    = re.compile(r"COO[:\s]+([\d]+)",                     re.IGNORECASE)
-_ECF_RE    = re.compile(r"ECF[:\s#]+([\d]+)",                    re.IGNORECASE)
-_SUBTOTAL  = re.compile(r"SUB[\s-]?TOTAL[\s:R$]+([\d]+[,\.][\d]{2})", re.IGNORECASE)
-_DESCONTO  = re.compile(r"DESCONTO[\s:R$-]+([\d]+[,\.][\d]{2})", re.IGNORECASE)
-_TOTAL     = re.compile(r"(?:TOTAL\s+(?:GERAL|A\s+PAGAR)|TOTAL)[\s:R$]+([\d]+[,\.][\d]{2})", re.IGNORECASE)
-_EAN       = re.compile(r"\b(\d{8}|\d{12,14})\b")
-_PAGTO     = re.compile(
-    r"(DINHEIRO|CART[ÃA]O\s+CR[ÉE]DITO|CART[ÃA]O\s+D[ÉE]BITO|PIX|CREDIT|DEBIT|CASH)"
-    r"[\s:R$]+([\d]+[,\.][\d]{2})",
+_RE_SUBTOTAL  = re.compile(r"(?:subtotal|sub[-\s]?total)\s*[:\-]?\s*([\d.,]+)", re.IGNORECASE)
+_RE_DESCONTO  = re.compile(r"(?:desconto|desc\.?)\s*[:\-]?\s*([\d.,]+)", re.IGNORECASE)
+_RE_TOTAL     = re.compile(r"(?:^|\s)total\s*[:\-]?\s*([\d.,]+)", re.IGNORECASE | re.MULTILINE)
+_RE_EAN       = re.compile(r"\b(\d{13})\b")
+_RE_COO       = re.compile(r"COO\s*[:\-=]?\s*(\d+)", re.IGNORECASE)
+_RE_SAT       = re.compile(r"SAT\s*[:\-=]?\s*(\d{6,})", re.IGNORECASE)
+_RE_NFCE      = re.compile(r"NFC-e\s*[:\-=]?\s*(\d+)", re.IGNORECASE)
+_RE_PAGAMENTO = re.compile(
+    r"(?:dinheiro|cart[aã]o\s+cr[eé]dito|cart[aã]o\s+d[eé]bito|pix|vale[-\s]?refeição)",
     re.IGNORECASE,
 )
+
+
+def _to_float(val: str) -> float:
+    """Converte string monetária BR (1.234,56) para float."""
+    return float(val.replace(".", "").replace(",", "."))
+
+
+@dataclass
+class Coupon:
+    raw_text: str
+    numero_sat: Optional[str]  = None
+    numero_coo: Optional[str]  = None
+    numero_nfce: Optional[str] = None
+    subtotal: Optional[float]  = None
+    desconto: Optional[float]  = None
+    total: Optional[float]     = None
+    eans: list[str]            = field(default_factory=list)
+    formas_pagamento: list[str]= field(default_factory=list)
+
+    def get_numero(self) -> Optional[str]:
+        return self.numero_sat or self.numero_nfce or self.numero_coo
 
 
 class CouponPDFParser:
-    """Extrai todos os cupons do PDF carregado pelo FileLoader."""
+    """Extrai e parseia cupons fiscais de páginas PDF brutas."""
 
-    def __init__(self, pdf_pages: List[Any]) -> None:
+    def __init__(self, pdf_pages: list[str]):
         self.pdf_pages = pdf_pages
+        self._coupons: list[Coupon] = []
+        self._parse_all()
 
-    def extract_all(self) -> List[CouponBlock]:
-        full_text = self._extract_full_text()
-        blocks    = self._split_into_blocks(full_text)
-        coupons   = [self._parse_block(b) for b in blocks if b.strip()]
-        log.info("CouponPDFParser: %d blocos → %d cupons parseados.", len(blocks), len(coupons))
-        return coupons
+    # ------------------------------------------------------------------
+    # Pipeline de parsing
+    # ------------------------------------------------------------------
 
-    # ── Extração de texto ────────────────────────────────────────────────────
-    def _extract_full_text(self) -> str:
-        parts: List[str] = []
-        for i, page in enumerate(self.pdf_pages):
-            try:
-                text = page.extract_text() or ""
-                parts.append(text)
-            except Exception as exc:
-                log.warning("Erro ao extrair texto da página %d: %s", i + 1, exc)
-        return "\n".join(parts)
+    def _parse_all(self) -> None:
+        full_text = "\n".join(self.pdf_pages)
+        blocks = self._split_into_blocks(full_text)
+        for block in blocks:
+            c = self._parse_block(block)
+            if c:
+                self._coupons.append(c)
+        logger.info("CouponPDFParser: %d cupons extraídos", len(self._coupons))
 
-    @staticmethod
-    def _split_into_blocks(text: str) -> List[str]:
-        """Divide o texto em blocos pelo padrão de cabeçalho de cupom."""
-        positions = [m.start() for m in _BLOCK_HEADER.finditer(text)]
+    def _split_into_blocks(self, text: str) -> list[str]:
+        """Divide o texto em blocos por padrão de cabeçalho de cupom."""
+        positions = [m.start() for m in _COUPON_HEADERS.finditer(text)]
         if not positions:
-            # Sem marcadores: trata o texto todo como um bloco
             return [text]
-        blocks: List[str] = []
+        blocks = []
         for i, start in enumerate(positions):
             end = positions[i + 1] if i + 1 < len(positions) else len(text)
             blocks.append(text[start:end])
+        logger.debug("Blocos de cupom encontrados: %d", len(blocks))
         return blocks
 
-    # ── Parse de bloco individual ────────────────────────────────────────────
-    def _parse_block(self, block: str) -> CouponBlock:
-        cb = CouponBlock(raw_text=block)
-
-        cb.sat_number  = self._first_group(_SAT_RE,   block)
-        cb.nfce_number = self._first_group(_NFCE_RE,  block)
-        cb.coo_number  = self._first_group(_COO_RE,   block)
-        cb.ecf_number  = self._first_group(_ECF_RE,   block)
-
-        cb.subtotal = self._parse_money(_first_group_or_none(_SUBTOTAL, block))
-        cb.desconto = self._parse_money(_first_group_or_none(_DESCONTO, block))
-        cb.total    = self._parse_money(_first_group_or_none(_TOTAL,    block))
-
-        cb.eans     = _EAN.findall(block)
-        cb.pagamentos = [
-            {"tipo": m.group(1).upper(), "valor": self._parse_money(m.group(2))}
-            for m in _PAGTO.finditer(block)
-        ]
-
-        return cb
-
-    # ── Utilitários ──────────────────────────────────────────────────────────
-    @staticmethod
-    def _first_group(pattern: re.Pattern, text: str) -> Optional[str]:
-        m = pattern.search(text)
-        return m.group(1).strip() if m else None
-
-    @staticmethod
-    def _parse_money(val: Optional[str]) -> Optional[float]:
-        if val is None:
+    def _parse_block(self, block: str) -> Optional[Coupon]:
+        if not block.strip():
             return None
-        try:
-            return float(val.replace(".", "").replace(",", "."))
-        except ValueError:
-            return None
+        c = Coupon(raw_text=block)
 
+        m = _RE_SAT.search(block)
+        if m:
+            c.numero_sat = m.group(1).strip()
 
-def _first_group_or_none(pattern: re.Pattern, text: str) -> Optional[str]:
-    m = pattern.search(text)
-    return m.group(1) if m else None
+        m = _RE_COO.search(block)
+        if m:
+            c.numero_coo = m.group(1).strip()
+
+        m = _RE_NFCE.search(block)
+        if m:
+            c.numero_nfce = m.group(1).strip()
+
+        m = _RE_SUBTOTAL.search(block)
+        if m:
+            try:
+                c.subtotal = _to_float(m.group(1))
+            except ValueError:
+                pass
+
+        m = _RE_DESCONTO.search(block)
+        if m:
+            try:
+                c.desconto = _to_float(m.group(1))
+            except ValueError:
+                pass
+
+        totals = _RE_TOTAL.findall(block)
+        if totals:
+            try:
+                c.total = _to_float(totals[-1])
+            except ValueError:
+                pass
+
+        c.eans = list(dict.fromkeys(_RE_EAN.findall(block)))
+
+        c.formas_pagamento = list({
+            m.group(0).lower()
+            for m in _RE_PAGAMENTO.finditer(block)
+        })
+
+        return c
+
+    # ------------------------------------------------------------------
+    # Consultas
+    # ------------------------------------------------------------------
+
+    def get_by_numero(self, numero: str) -> Optional[Coupon]:
+        """Busca cupom por SAT, NFC-e ou COO."""
+        numero = str(numero).strip()
+        for c in self._coupons:
+            if numero in (c.numero_sat, c.numero_nfce, c.numero_coo):
+                return c
+        return None
+
+    def get_by_eans(self, eans: list[str]) -> Optional[Coupon]:
+        """Fallback: retorna o cupom que contém mais EANs coincidentes."""
+        best, best_score = None, 0
+        ean_set = set(eans)
+        for c in self._coupons:
+            score = len(ean_set & set(c.eans))
+            if score > best_score:
+                best, best_score = c, score
+        return best if best_score > 0 else None
+
+    @property
+    def coupons(self) -> list[Coupon]:
+        return self._coupons
