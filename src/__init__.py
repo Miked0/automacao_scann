@@ -1,1 +1,1 @@
-# Pacote de módulos do Scanntech QA Validator
+# Scanntech QA Validator — pacote src
