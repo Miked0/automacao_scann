@@ -1,150 +1,123 @@
 """
-M2 — AuditParser
-Lê o DataFrame do Export Audit e indexa cada movimento pelo número de cupom.
-
-O campo `Request` de cada linha contém o JSON enviado à API com aspas
-escapadas como """. Normaliza via str.replace('""', '"') antes do
-json.loads, com fallback regex caso o JSON esteja malformado.
+Módulo 2 — AuditParser
+Responsabilidade: Indexa movimentos do export Audit pelo nº cupom.
 """
 
-from __future__ import annotations
 import json
 import logging
 import re
-from typing import Dict, List, Optional
+from typing import Optional
 
 import pandas as pd
 
-from .models import AuditMovement
-
-log = logging.getLogger(__name__)
-
-# Campos obrigatórios extraídos do JSON da requisição
-_COUPON_FIELDS = (
-    "numero", "numero_sat", "numero_nfce", "numeroCupom",
-    "sat", "nfce", "ecf",
-)
+logger = logging.getLogger(__name__)
 
 
 class AuditParser:
-    """Indexa movimentos do Audit pelo número de cupom."""
+    """Parseia e indexa o export Audit pelo número do cupom."""
 
-    def __init__(self, df: pd.DataFrame) -> None:
-        self.df = df
+    def __init__(self, audit_df: pd.DataFrame):
+        self.audit_df = audit_df
+        # índice: numero_cupom (str) → lista de dicts com dados do movimento
+        self._index: dict[str, list[dict]] = {}
+        self._build_index()
 
-    # ── Público ──────────────────────────────────────────────────────────────
-    def build_index(self) -> Dict[str, AuditMovement]:
-        """
-        Processa todas as linhas e devolve dict  {cupom_key: AuditMovement}.
-        cupom_key é o número do cupom em lowercase sem espaços.
-        """
-        index: Dict[str, AuditMovement] = {}
-        for _, row in self.df.iterrows():
-            mv = self._parse_row(row)
-            if mv is None:
+    # ------------------------------------------------------------------
+    # Construção do índice
+    # ------------------------------------------------------------------
+
+    def _build_index(self) -> None:
+        """Itera o DataFrame e indexa cada linha pelo campo 'numero' do JSON."""
+        for _, row in self.audit_df.iterrows():
+            raw = row.get("Request", "")
+            movement = self._parse_request(str(raw))
+            if not movement:
                 continue
-            key = mv.cupom_number.strip().lower()
-            if key in index:
-                log.debug("Cupom duplicado no Audit: %s — mantendo primeira ocorrência.", key)
-            else:
-                index[key] = mv
-        log.info("Audit indexado: %d movimentos únicos.", len(index))
-        return index
+            numero = str(movement.get("numero", "")).strip()
+            if numero:
+                self._index.setdefault(numero, []).append(movement)
+        logger.info("AuditParser: %d cupons indexados", len(self._index))
 
-    # ── Privado ──────────────────────────────────────────────────────────────
-    def _parse_row(self, row: pd.Series) -> Optional[AuditMovement]:
-        request_raw = self._get_request_column(row)
-        if not request_raw:
-            return None
-
-        data = self._safe_json_loads(str(request_raw))
-        if data is None:
-            return None
-
-        cupom_number = self._extract_cupom_number(data)
-        if not cupom_number:
-            log.debug("Linha sem número de cupom identificável; pulando.")
-            return None
-
-        status_code = self._try_int(row.get("StatusCode") or row.get("status_code"))
-
-        # Extrai campos do JSON principal
-        total            = self._try_float(data.get("total"))
-        descuento_total  = self._try_float(data.get("descuentoTotal") or data.get("descuento"))
-        cancelacion      = data.get("cancelacion")
-        if isinstance(cancelacion, str):
-            cancelacion = cancelacion.lower() in ("true", "1", "yes")
-
-        detalles = data.get("detalles") or []
-        pagos    = data.get("pagos")    or []
-        bin_val  = str(data.get("bin", "") or "").strip() or None
-
-        return AuditMovement(
-            cupom_number    = cupom_number,
-            raw_json        = data,
-            status_code     = status_code,
-            total           = total,
-            descuento_total = descuento_total,
-            cancelacion     = cancelacion,
-            detalles        = detalles if isinstance(detalles, list) else [],
-            pagos           = pagos    if isinstance(pagos,    list) else [],
-            bin_value       = bin_val,
-        )
-
-    # ── Utilitários ──────────────────────────────────────────────────────────
-    @staticmethod
-    def _get_request_column(row: pd.Series) -> Optional[str]:
-        """Procura a coluna Request independentemente de maiúsculas/minúsculas."""
-        for col in row.index:
-            if str(col).strip().lower() == "request":
-                val = row[col]
-                if pd.notna(val) and str(val).strip():
-                    return str(val)
-        return None
-
-    @staticmethod
-    def _safe_json_loads(raw: str) -> Optional[Dict]:
-        """Normaliza aspas duplas escapadas e tenta json.loads; fallback regex."""
-        # Normaliza ""campo"" → "campo"
-        normalized = raw.replace('""', '"')
-        # Remove wrapper extra se vier como string JSON dentro de string
+    def _parse_request(self, raw: str) -> Optional[dict]:
+        """
+        Normaliza aspas duplas escapadas e tenta json.loads.
+        Fallback: extrai campos via regex se o JSON estiver malformado.
+        """
+        # Normaliza "" → " (padrão de escape do export)
+        normalized = raw.replace('""', '"').strip()
+        # Remove wrapping de aspas externas, se houver
         if normalized.startswith('"') and normalized.endswith('"'):
-            normalized = normalized[1:-1].replace('\\"', '"')
+            normalized = normalized[1:-1]
+
         try:
-            return json.loads(normalized)
+            data = json.loads(normalized)
+            if isinstance(data, dict):
+                return data
         except json.JSONDecodeError:
             pass
 
-        # Fallback: extrai o primeiro objeto JSON via regex
-        match = re.search(r'\{.*\}', raw, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(0).replace('""', '"'))
-            except json.JSONDecodeError:
-                pass
+        # Fallback regex: extrai campos chave manualmente
+        return self._regex_fallback(normalized)
 
-        log.warning("Não foi possível parsear JSON da linha; raw[:120]=%s", raw[:120])
+    def _regex_fallback(self, text: str) -> Optional[dict]:
+        """Extrai campos mínimos via regex quando o JSON está malformado."""
+        result: dict = {}
+        patterns = {
+            "numero":         r'"numero"\s*:\s*"([^"]+)"',
+            "total":          r'"total"\s*:\s*([\d.]+)',
+            "descuentoTotal": r'"descuentoTotal"\s*:\s*([\d.]+)',
+            "cancelacion":    r'"cancelacion"\s*:\s*(true|false)',
+            "status":         r'"status"\s*:\s*(\d+)',
+        }
+        for key, pat in patterns.items():
+            m = re.search(pat, text)
+            if m:
+                val = m.group(1)
+                if key in ("total", "descuentoTotal"):
+                    result[key] = float(val)
+                elif key == "cancelacion":
+                    result[key] = val == "true"
+                elif key == "status":
+                    result[key] = int(val)
+                else:
+                    result[key] = val
+
+        if "numero" in result:
+            logger.warning("Fallback regex usado para cupom %s", result["numero"])
+            return result
         return None
 
-    @staticmethod
-    def _extract_cupom_number(data: Dict) -> Optional[str]:
-        """Tenta vários campos para encontrar o número do cupom."""
-        for field in _COUPON_FIELDS:
-            val = data.get(field)
-            if val and str(val).strip():
-                return str(val).strip()
-        return None
+    # ------------------------------------------------------------------
+    # Consultas
+    # ------------------------------------------------------------------
+
+    def get_by_numero(self, numero: str) -> list[dict]:
+        """Retorna todos os movimentos indexados pelo número do cupom."""
+        return self._index.get(str(numero).strip(), [])
+
+    def get_by_eans(self, eans: list[str]) -> list[dict]:
+        """
+        Fallback: busca movimentos cujos detalles contenham ao menos um EAN da lista.
+        Útil quando o número do cupom não está disponível.
+        """
+        results = []
+        for movements in self._index.values():
+            for mov in movements:
+                mov_eans = self._extract_eans(mov)
+                if any(e in mov_eans for e in eans):
+                    results.append(mov)
+        return results
 
     @staticmethod
-    def _try_float(val) -> Optional[float]:
-        try:
-            return float(val)
-        except (TypeError, ValueError):
-            return None
+    def _extract_eans(movement: dict) -> set[str]:
+        """Extrai EANs do campo detalles do movimento."""
+        eans: set[str] = set()
+        for item in movement.get("detalles", []):
+            ean = str(item.get("ean", "")).strip()
+            if ean:
+                eans.add(ean)
+        return eans
 
-    @staticmethod
-    def _try_int(val) -> Optional[int]:
-        try:
-            return int(val)
-        except (TypeError, ValueError):
-            return None
+    def all_numeros(self) -> list[str]:
+        """Retorna todos os números de cupom indexados."""
+        return list(self._index.keys())
