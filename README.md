@@ -1,68 +1,93 @@
-# Automação QA Roteiro PDV
+# Scanntech QA Validator
 
-Automação para validação de roteiros de teste de PDV integrado com Scanntech.
+Automação de validação de roteiros QA para promoções Scanntech.
+Processa TEMPLATE xlsx + Export Audit + PDF de cupons e preenche automaticamente as colunas de resultado.
 
-[![Abrir no Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Miked0/automacao_scann/blob/main/automacao_scann_colab.ipynb)
+## Arquitetura — 7 Módulos
 
-## Etapas de validação
+| # | Módulo | Responsabilidade |
+|---|--------|------------------|
+| 1 | `FileLoader` | Valida existência e carrega todos os artefatos |
+| 2 | `AuditParser` | Indexa movimentos do Audit pelo nº cupom |
+| 3 | `CouponPDFParser` | Extrai cupons fiscais (DANFE/NFC-e/SAT) do PDF |
+| 4 | `PromoEngine` | Motor de validação por tipo de promoção |
+| 5 | `TestRunner` | Orquestra a validação linha a linha do roteiro |
+| 6 | `ResultWriter` | Preenche colunas de resultado + salva xlsx |
+| 7 | `AuditLogger` | Gera log JSON estruturado de cada check |
 
-| Etapa | Arquivos necessários | O que valida |
-|-------|----------------------|--------------|
-| **1** | Planilha `.xlsx` | Parse de itens, pagamento, subtotal/desconto/total |
-| **2** | Planilha + JSON de venda | Cruza EANs, quantidades, total e descontos com o movimento |
-| **3** | Planilha + JSON de venda + JSON de cupons | Adiciona validação de tipo de promo, limite, BIN e forma de pagamento |
+## Instalação
 
-## Como usar no Google Colab
+```bash
+pip install openpyxl pandas pdfplumber
+```
 
-1. Clique no badge acima para abrir o notebook
-2. Execute as células em ordem
-3. Na **Célula 3**, edite `ETAPA = 1`, `2` ou `3`
-4. Na **Célula 4**, faça upload dos arquivos conforme a etapa:
-   - Etapa 1: só a planilha
-   - Etapa 2: planilha + JSON de venda
-   - Etapa 3: planilha + JSON de venda + JSON de cupons
-5. Execute a **Célula 5** para rodar a validação
-6. Veja o resumo na **Célula 6** e baixe o resultado na **Célula 7**
+## Uso
 
-## Estrutura do projeto
+```bash
+python scanntech_qa_validator.py \
+  --roteiro  "TEMPLATE_COM_BIN_NOVO.xlsx" \
+  --audit    "export_tickets_audit_companyId-200056.xlsx" \
+  --pdf      "ilovepdf_merged-1-2.pdf" \
+  --output   "TEMPLATE_PREENCHIDO.xlsx" \
+  --log      "qa_audit_log.json"
+```
+
+O parâmetro `--json-dir` é opcional e aponta para um diretório com JSONs de venda avulsos.
+
+## Fluxo de Execução
 
 ```
-automacao_scann/
-├── input/                   ← arquivos de entrada (planilha, JSONs)
-├── output/                  ← resultado gerado
-├── src/
-│   ├── main.py              ← entry point
-│   ├── reader.py            ← leitura e detecção de blocos
-│   ├── parser_items.py      ← parser de itens da venda
-│   ├── payments.py          ← normalização de pagamentos
-│   ├── validators.py        ← validações com Decimal
-│   └── exporters.py         ← exportação para Excel (3 abas)
-├── automacao_scann_colab.ipynb
+FileLoader → AuditParser → CouponPDFParser → PromoEngine
+                                              ↓
+                                          TestRunner  ← (10 checks por linha)
+                                              ↓
+                              ResultWriter + AuditLogger
+```
+
+## Checks por Linha do Roteiro
+
+1. **Cupom localizado** — por nº SAT/ECF/NFCE ou fallback por EANs
+2. **HTTP 200** — Status code = 200 no Audit
+3. **Cancelamento** — `cancelacion` true/false conforme observação
+4. **Total** — `|mov.total − roteiro.total| ≤ R$0,05`
+5. **Desconto** — `|mov.descuentoTotal − roteiro.desconto| ≤ R$0,05`
+6. **Meio de pagamento** — `codigoTipoPago` mapeado
+7. **BIN** — valida presença quando exigido
+8. **Promoção** — dispatcher por tipo (LLEVAPAGA, DESCUENTOVARIABLE, etc.)
+9. **Desconto manual indevido** — rejeita desconto adicional quando proibido
+10. **Schema JSON mínimo** — campos `total`, `numero`, `detalles`, `pagos`
+
+## Tipos de Promoção Suportados
+
+| Tipo | Lógica |
+|------|--------|
+| `LLEVAPAGA` | `lotes × (trigger − paga) × preço_unit` vs `descuentoTotal` |
+| `DESCUENTOVARIABLE` | `subtotal_promo × pct` vs `descuentoTotal` |
+| `PRECIOFIJO` | `lotes × preco_fixo` vs valor cobrado nos itens |
+| `ADICIONALREGALO` | `descuentoTotal > 0` quando presente esperado |
+| `ADICIONALDESCUENTO` | `descuento_item / preco_item ≈ pct_promo ± 2%` |
+| `DESCUENTOFIJO` | `descuentoTotal == valor_fixo ± R$0,05` |
+
+## Saídas
+
+- **TEMPLATE_PREENCHIDO.xlsx** — Roteiro com colunas R/S/T preenchidas (Ok/Erro) e coluna U com justificativas
+- **qa_validation.log** — Log textual com timestamps
+- **qa_audit_log.json** — Log estruturado por teste
+
+## Estrutura do Projeto
+
+```
+.
+├── scanntech_qa_validator.py   ← Ponto de entrada CLI
 ├── requirements.txt
-└── README.md
+├── src/
+│   ├── __init__.py
+│   ├── models.py               ← Dataclasses compartilhadas
+│   ├── file_loader.py          ← M1
+│   ├── audit_parser.py         ← M2
+│   ├── coupon_pdf_parser.py    ← M3
+│   ├── promo_engine.py         ← M4
+│   ├── test_runner.py          ← M5
+│   ├── result_writer.py        ← M6
+│   └── audit_logger.py         ← M7
 ```
-
-## Status de validação
-
-| Status | Significado |
-|--------|-------------|
-| `OK` | Caso validado sem divergências |
-| `ALERTA` | Diferença ≤ 0,01 dentro da tolerância |
-| `REVISAR` | Caso especial detectado (acréscimo, cancelamento, BIN) |
-| `ERRO_PARSE` | Falha ao parsear itens |
-| `ERRO_VALOR` | Subtotal/desconto/total com problema aritmético |
-| `ERRO_PAGAMENTO` | Forma de pagamento não mapeada |
-| `DIVERGENCIA_JSON` | Diferença encontrada ao cruzar com o JSON de venda |
-| `DIVERGENCIA_CUPON` | Tipo de promoção diverge do cupão consultado |
-| `SEM_MATCH` | Número do teste não encontrado no JSON |
-
-## Mapeamento de pagamentos
-
-| Texto na planilha | codigoTipoPago |
-|-------------------|----------------|
-| Dinheiro / Efetivo | 9 |
-| Cartão Crédito | 10 |
-| Cheque | 11 |
-| Vale | 12 |
-| Cartão Débito | 13 |
-| PIX / QR | 14 |

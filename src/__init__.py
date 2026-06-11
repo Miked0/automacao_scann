@@ -1,22 +1,23 @@
 """
-src/ — Módulos do validador QA Scanntech.
+src — pacote principal do Scanntech QA Validator
 
-Arquitetura:
-  1. FileLoader      — Valida existência e carrega todos os artefatos
-  2. AuditParser     — Indexa movimentos do export Audit pelo nº cupom
-  3. CouponPDFParser — Extrai cupons fiscais (DANFE/NFC-e/SAT) do PDF
-  4. PromoEngine     — Motor de validação por tipo de promoção
-  5. TestRunner      — Orquestra a validação linha a linha do roteiro
-  6. ResultWriter    — Preenche colunas de resultado + salva xlsx
-  7. AuditLogger     — Gera log JSON estruturado de cada check
+Módulos:
+    file_loader        — M1: valida e carrega artefatos
+    audit_parser       — M2: indexa movimentos do Audit
+    coupon_pdf_parser  — M3: extrai cupons do PDF
+    promo_engine       — M4: motor de validação de promoções
+    test_runner        — M5: orquestra validações linha a linha
+    result_writer      — M6: preenche colunas e salva xlsx
+    audit_logger       — M7: gera log JSON estruturado
 """
-from .file_loader import FileLoader
-from .audit_parser import AuditParser
+
+from .file_loader       import FileLoader
+from .audit_parser      import AuditParser
 from .coupon_pdf_parser import CouponPDFParser
-from .promo_engine import PromoEngine
-from .test_runner import TestRunner
-from .result_writer import ResultWriter
-from .audit_logger import AuditLogger
+from .promo_engine      import PromoEngine
+from .test_runner       import TestRunner
+from .result_writer     import ResultWriter
+from .audit_logger      import AuditLogger
 
 __all__ = [
     "FileLoader",

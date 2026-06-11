@@ -1,124 +1,150 @@
 """
-Módulo 2 — AuditParser
-Responsabilidade: Indexa movimentos do export Audit pelo nº cupom.
+M2 — AuditParser
+Lê o DataFrame do Export Audit e indexa cada movimento pelo número de cupom.
+
+O campo `Request` de cada linha contém o JSON enviado à API com aspas
+escapadas como """. Normaliza via str.replace('""', '"') antes do
+json.loads, com fallback regex caso o JSON esteja malformado.
 """
+
+from __future__ import annotations
 import json
-import re
 import logging
+import re
 from typing import Dict, List, Optional
+
 import pandas as pd
 
-logger = logging.getLogger(__name__)
+from .models import AuditMovement
+
+log = logging.getLogger(__name__)
+
+# Campos obrigatórios extraídos do JSON da requisição
+_COUPON_FIELDS = (
+    "numero", "numero_sat", "numero_nfce", "numeroCupom",
+    "sat", "nfce", "ecf",
+)
 
 
 class AuditParser:
-    """
-    Parseia o export Audit (xlsx) e indexa cada movimento de venda
-    pelo número do cupom (campo 'numero' no JSON da requisição).
-    """
+    """Indexa movimentos do Audit pelo número de cupom."""
 
-    def __init__(self, df_audit: pd.DataFrame):
-        self.df = df_audit
-        self._index: Dict[str, List[dict]] = {}
-        self._raw_movements: List[dict] = []
-        self._parse()
+    def __init__(self, df: pd.DataFrame) -> None:
+        self.df = df
 
-    def _normalize_json_str(self, raw: str) -> str:
-        """Normaliza aspas duplas escapadas típicas do export Audit."""
-        if not isinstance(raw, str):
-            return ""
-        s = raw.strip()
-        if s.startswith('"') and s.endswith('"'):
-            s = s[1:-1]
-        s = s.replace('""', '"')
-        return s
-
-    def _extract_fallback(self, raw: str) -> Optional[dict]:
-        """Extração regex de campos críticos quando json.loads falha."""
-        result = {}
-        patterns = {
-            "numero": r'"numero"\s*:\s*"([^"]+)"',
-            "total": r'"total"\s*:\s*([\d.]+)',
-            "descuentoTotal": r'"descuentoTotal"\s*:\s*([\d.]+)',
-            "cancelacion": r'"cancelacion"\s*:\s*(true|false)',
-        }
-        for field, pat in patterns.items():
-            m = re.search(pat, raw, re.IGNORECASE)
-            if m:
-                val = m.group(1)
-                if field in ("total", "descuentoTotal"):
-                    try:
-                        val = float(val)
-                    except ValueError:
-                        pass
-                elif field == "cancelacion":
-                    val = val.lower() == "true"
-                result[field] = val
-        return result if result else None
-
-    def _parse(self):
-        """Parseia todas as linhas do DataFrame e indexa por numero."""
-        request_col = None
-        status_col = None
-
-        for col in self.df.columns:
-            col_lower = str(col).lower()
-            if "request" in col_lower and request_col is None:
-                request_col = col
-            if "status" in col_lower and status_col is None:
-                status_col = col
-
-        if request_col is None:
-            logger.warning("Coluna 'Request' não encontrada no Audit. Tentando primeira coluna com JSON.")
-            for col in self.df.columns:
-                sample = str(self.df[col].dropna().iloc[0]) if not self.df[col].dropna().empty else ""
-                if "numero" in sample or "total" in sample:
-                    request_col = col
-                    break
-
-        if request_col is None:
-            logger.error("Não foi possível identificar coluna de Request no Audit.")
-            return
-
-        for idx, row in self.df.iterrows():
-            raw = row.get(request_col, "")
-            http_status = row.get(status_col, None) if status_col else None
-            normalized = self._normalize_json_str(str(raw))
-            mov = None
-            try:
-                mov = json.loads(normalized)
-            except (json.JSONDecodeError, ValueError):
-                mov = self._extract_fallback(normalized)
-                if mov:
-                    logger.debug(f"Linha {idx}: JSON malformado — fallback regex aplicado.")
-                else:
-                    logger.warning(f"Linha {idx}: falha total no parse do JSON.")
-                    continue
-
-            if mov is None:
+    # ── Público ──────────────────────────────────────────────────────────────
+    def build_index(self) -> Dict[str, AuditMovement]:
+        """
+        Processa todas as linhas e devolve dict  {cupom_key: AuditMovement}.
+        cupom_key é o número do cupom em lowercase sem espaços.
+        """
+        index: Dict[str, AuditMovement] = {}
+        for _, row in self.df.iterrows():
+            mv = self._parse_row(row)
+            if mv is None:
                 continue
+            key = mv.cupom_number.strip().lower()
+            if key in index:
+                log.debug("Cupom duplicado no Audit: %s — mantendo primeira ocorrência.", key)
+            else:
+                index[key] = mv
+        log.info("Audit indexado: %d movimentos únicos.", len(index))
+        return index
 
-            mov["_http_status"] = int(http_status) if http_status else None
-            mov["_row_index"] = idx
-            self._raw_movements.append(mov)
+    # ── Privado ──────────────────────────────────────────────────────────────
+    def _parse_row(self, row: pd.Series) -> Optional[AuditMovement]:
+        request_raw = self._get_request_column(row)
+        if not request_raw:
+            return None
 
-            numero = str(mov.get("numero", "")).strip()
-            if numero:
-                self._index.setdefault(numero, []).append(mov)
-                num_clean = numero.lstrip("-")
-                if num_clean != numero:
-                    self._index.setdefault(num_clean, []).append(mov)
+        data = self._safe_json_loads(str(request_raw))
+        if data is None:
+            return None
 
-        logger.info(f"AuditParser: {len(self._raw_movements)} movimentos parseados, "
-                    f"{len(self._index)} cupons únicos indexados.")
+        cupom_number = self._extract_cupom_number(data)
+        if not cupom_number:
+            log.debug("Linha sem número de cupom identificável; pulando.")
+            return None
 
-    def get_by_numero(self, numero: str) -> List[dict]:
-        """Retorna lista de movimentos pelo número do cupom."""
-        return self._index.get(str(numero).strip(), [])
+        status_code = self._try_int(row.get("StatusCode") or row.get("status_code"))
 
-    def get_all(self) -> List[dict]:
-        return self._raw_movements
+        # Extrai campos do JSON principal
+        total            = self._try_float(data.get("total"))
+        descuento_total  = self._try_float(data.get("descuentoTotal") or data.get("descuento"))
+        cancelacion      = data.get("cancelacion")
+        if isinstance(cancelacion, str):
+            cancelacion = cancelacion.lower() in ("true", "1", "yes")
 
-    @property
-    def index(self) -> Dict[str, List[dict]]:
-        return self._index
+        detalles = data.get("detalles") or []
+        pagos    = data.get("pagos")    or []
+        bin_val  = str(data.get("bin", "") or "").strip() or None
+
+        return AuditMovement(
+            cupom_number    = cupom_number,
+            raw_json        = data,
+            status_code     = status_code,
+            total           = total,
+            descuento_total = descuento_total,
+            cancelacion     = cancelacion,
+            detalles        = detalles if isinstance(detalles, list) else [],
+            pagos           = pagos    if isinstance(pagos,    list) else [],
+            bin_value       = bin_val,
+        )
+
+    # ── Utilitários ──────────────────────────────────────────────────────────
+    @staticmethod
+    def _get_request_column(row: pd.Series) -> Optional[str]:
+        """Procura a coluna Request independentemente de maiúsculas/minúsculas."""
+        for col in row.index:
+            if str(col).strip().lower() == "request":
+                val = row[col]
+                if pd.notna(val) and str(val).strip():
+                    return str(val)
+        return None
+
+    @staticmethod
+    def _safe_json_loads(raw: str) -> Optional[Dict]:
+        """Normaliza aspas duplas escapadas e tenta json.loads; fallback regex."""
+        # Normaliza ""campo"" → "campo"
+        normalized = raw.replace('""', '"')
+        # Remove wrapper extra se vier como string JSON dentro de string
+        if normalized.startswith('"') and normalized.endswith('"'):
+            normalized = normalized[1:-1].replace('\\"', '"')
+        try:
+            return json.loads(normalized)
+        except json.JSONDecodeError:
+            pass
+
+        # Fallback: extrai o primeiro objeto JSON via regex
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0).replace('""', '"'))
+            except json.JSONDecodeError:
+                pass
+
+        log.warning("Não foi possível parsear JSON da linha; raw[:120]=%s", raw[:120])
+        return None
+
+    @staticmethod
+    def _extract_cupom_number(data: Dict) -> Optional[str]:
+        """Tenta vários campos para encontrar o número do cupom."""
+        for field in _COUPON_FIELDS:
+            val = data.get(field)
+            if val and str(val).strip():
+                return str(val).strip()
+        return None
+
+    @staticmethod
+    def _try_float(val) -> Optional[float]:
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _try_int(val) -> Optional[int]:
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return None
