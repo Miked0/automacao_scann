@@ -1,20 +1,11 @@
+# src/audit_parser.py
 """
 Módulo 2 — AuditParser
 Responsabilidade: Indexa movimentos do export Audit pelo nº cupom.
-
-Estrutura do export Audit (AUDIT_TICKETS):
-  Coluna I → status HTTP da resposta (200, 400, etc.)
-  Coluna S → JSON do Request (corpo enviado à API Scanntech)
-
-Estrutura de índice:
-  _index_numero : { numero (str) → list[dict] }   ← campo "numero" do JSON
-  _index_nfce   : { numeroNFCe (str) → list[dict] }
-  _index_sat    : { numeroSAT  (str) → list[dict] }
-  _index_ecf    : { numeroCOO  (str) → list[dict] }
-
-O dicionário de cada movimento contém:
-  - Todos os campos do JSON do Request
-  - "_http_status" (int): status HTTP lido da coluna I do DataFrame
+Correções v2:
+- Injeta _http_status da coluna separada do DataFrame (Coluna I)
+- Usa codigoBarras (não 'ean') para extrair EANs dos detalles
+- Trata número com prefixo '-' (cupons cancelados)
 """
 
 import json
@@ -26,125 +17,75 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Nomes conhecidos da coluna de status HTTP no export Audit.
-# O script tenta cada um em ordem até encontrar; fallback = posição 8 (col I).
-# ---------------------------------------------------------------------------
-_STATUS_COL_ALIASES = [
-    "status", "httpstatus", "http_status", "statuscode",
-    "http status", "response code", "responsecode", "codigo", "código",
-    "status code", "status_code",
+# Possíveis nomes da coluna de status HTTP no export Audit
+_STATUS_COL_CANDIDATES = [
+    "Código status", "Codigo status", "codigo_status",
+    "status_code", "StatusCode", "HTTP Status", "status",
 ]
-
-# Nomes conhecidos da coluna de Request JSON no export Audit.
-# Fallback = posição 18 (col S).
-_REQUEST_COL_ALIASES = [
-    "request", "json", "body", "payload", "request body",
-    "request_body", "requestbody", "req",
-]
-
-
-def _find_col(df: pd.DataFrame, aliases: list[str], fallback_pos: int) -> str:
-    """
-    Retorna o nome da coluna do DataFrame que corresponde a um dos aliases.
-    Se nenhum alias for encontrado, usa a coluna pela posição (0-based).
-    """
-    cols_lower = {str(c).strip().lower(): c for c in df.columns}
-    for alias in aliases:
-        if alias in cols_lower:
-            found = cols_lower[alias]
-            logger.info("Coluna detectada '%s' pelo alias '%s'", found, alias)
-            return found
-
-    # Fallback por posição
-    if fallback_pos < len(df.columns):
-        found = df.columns[fallback_pos]
-        logger.warning(
-            "Coluna não detectada por alias; usando posição %d → '%s'",
-            fallback_pos, found
-        )
-        return found
-
-    # Último recurso: primeira coluna
-    logger.warning("Fallback de posição inválido; usando primeira coluna.")
-    return df.columns[0]
 
 
 class AuditParser:
-    """Parseia e indexa o export Audit por múltiplas chaves de cupom."""
+    """Parseia e indexa o export Audit pelo número do cupom."""
 
     def __init__(self, audit_df: pd.DataFrame):
         self.audit_df = audit_df
-        self._index_numero: dict[str, list[dict]] = {}
-        self._index_nfce:   dict[str, list[dict]] = {}
-        self._index_sat:    dict[str, list[dict]] = {}
-        self._index_ecf:    dict[str, list[dict]] = {}
-
-        # Detecta as colunas corretas antes de indexar
-        self._col_status  = _find_col(audit_df, _STATUS_COL_ALIASES,  fallback_pos=8)   # col I
-        self._col_request = _find_col(audit_df, _REQUEST_COL_ALIASES, fallback_pos=18)  # col S
-
-        logger.info(
-            "AuditParser: coluna status='%s' (I), coluna request='%s' (S)",
-            self._col_status, self._col_request
-        )
-
+        self._status_col: Optional[str] = self._detect_status_col()
+        # índice: numero_cupom (str) → lista de dicts com dados do movimento
+        self._index: dict[str, list[dict]] = {}
         self._build_index()
+
+    # ------------------------------------------------------------------
+    # Detecção da coluna de status HTTP
+    # ------------------------------------------------------------------
+
+    def _detect_status_col(self) -> Optional[str]:
+        """Detecta qual coluna do DataFrame contém o status HTTP."""
+        for candidate in _STATUS_COL_CANDIDATES:
+            if candidate in self.audit_df.columns:
+                logger.info("AuditParser: coluna status HTTP detectada → '%s'", candidate)
+                return candidate
+        # Busca parcial
+        for col in self.audit_df.columns:
+            if "status" in str(col).lower():
+                logger.info("AuditParser: coluna status HTTP detectada (parcial) → '%s'", col)
+                return col
+        logger.warning("AuditParser: coluna de status HTTP não encontrada — usará 0")
+        return None
 
     # ------------------------------------------------------------------
     # Construção do índice
     # ------------------------------------------------------------------
 
     def _build_index(self) -> None:
+        """Itera o DataFrame e indexa cada linha pelo campo 'numero' do JSON."""
         for _, row in self.audit_df.iterrows():
-            # --- Status HTTP da coluna I ---
-            raw_status = row.get(self._col_status, 0)
-            try:
-                http_status = int(float(str(raw_status).strip()))
-            except (ValueError, TypeError):
-                http_status = 0
-
-            # --- JSON do Request da coluna S ---
-            raw_request = row.get(self._col_request, "")
-            movement = self._parse_request(str(raw_request))
+            raw = row.get("Request", "")
+            movement = self._parse_request(str(raw))
             if not movement:
                 continue
 
-            # Injeta o status HTTP no dicionário do movimento
-            # usando chave privada "_http_status" para não colidir com campos do JSON
-            movement["_http_status"] = http_status
+            # Injeta status HTTP do DataFrame (fora do JSON)
+            if self._status_col:
+                try:
+                    movement["_http_status"] = int(row[self._status_col])
+                except (ValueError, TypeError):
+                    movement["_http_status"] = 0
+            else:
+                movement["_http_status"] = 0
 
-            # Indexa pelo campo "numero" do JSON
             numero = str(movement.get("numero", "")).strip()
-            if numero and numero.lower() not in ("none", "nan", ""):
-                self._index_numero.setdefault(numero, []).append(movement)
+            if numero:
+                self._index.setdefault(numero, []).append(movement)
+                # Cupons cancelados têm numero com '-', indexar sem o '-' também
+                numero_sem_prefixo = numero.lstrip("-")
+                if numero_sem_prefixo != numero:
+                    self._index.setdefault(numero_sem_prefixo, []).append(movement)
 
-            # Índices alternativos
-            for key, idx in [
-                ("numeroNFCe", self._index_nfce),
-                ("nfce",       self._index_nfce),
-                ("numeroSAT",  self._index_sat),
-                ("sat",        self._index_sat),
-                ("numeroCOO",  self._index_ecf),
-                ("coo",        self._index_ecf),
-                ("ecf",        self._index_ecf),
-            ]:
-                val = str(movement.get(key, "")).strip()
-                if val and val.lower() not in ("none", "nan", ""):
-                    idx.setdefault(val, []).append(movement)
-
-        logger.info(
-            "AuditParser: %d cupons indexados (numero=%d nfce=%d sat=%d ecf=%d)",
-            len(self._index_numero),
-            len(self._index_numero),
-            len(self._index_nfce),
-            len(self._index_sat),
-            len(self._index_ecf),
-        )
+        logger.info("AuditParser: %d chaves indexadas", len(self._index))
 
     def _parse_request(self, raw: str) -> Optional[dict]:
         """
-        Normaliza aspas duplas escapadas ("") e tenta json.loads.
+        Normaliza aspas duplas escapadas e tenta json.loads.
         Fallback: extrai campos via regex se o JSON estiver malformado.
         """
         normalized = raw.replace('""', '"').strip()
@@ -164,13 +105,10 @@ class AuditParser:
         """Extrai campos mínimos via regex quando o JSON está malformado."""
         result: dict = {}
         patterns = {
-            "numero":         r'"numero"\s*:\s*"([^"]+)"',
-            "numeroNFCe":     r'"numero(?:NFCe|NFCE|nfce)"\s*:\s*"([^"]+)"',
-            "numeroSAT":      r'"numero(?:SAT|sat)"\s*:\s*"([^"]+)"',
-            "numeroCOO":      r'"numero(?:COO|coo|ECF|ecf)"\s*:\s*"([^"]+)"',
-            "total":          r'"total"\s*:\s*([\d.]+)',
-            "descuentoTotal": r'"descuentoTotal"\s*:\s*([\d.]+)',
-            "cancelacion":    r'"cancelacion"\s*:\s*(true|false)',
+            "numero":        r'"numero"\s*:\s*"([^"]+)"',
+            "total":         r'"total"\s*:\s*([\d.]+)',
+            "descuentoTotal":r'"descuentoTotal"\s*:\s*([\d.]+)',
+            "cancelacion":   r'"cancelacion"\s*:\s*(true|false)',
         }
         for key, pat in patterns.items():
             m = re.search(pat, text)
@@ -183,8 +121,8 @@ class AuditParser:
                 else:
                     result[key] = val
 
-        if result:
-            logger.warning("Fallback regex usado — campos extraídos: %s", list(result.keys()))
+        if "numero" in result:
+            logger.warning("Fallback regex usado para cupom %s", result["numero"])
             return result
         return None
 
@@ -193,48 +131,43 @@ class AuditParser:
     # ------------------------------------------------------------------
 
     def get_by_numero(self, numero: str) -> list[dict]:
-        return self._index_numero.get(str(numero).strip(), [])
-
-    def get_by_nfce(self, numero_nfce: str) -> list[dict]:
-        return self._index_nfce.get(str(numero_nfce).strip(), [])
-
-    def get_by_sat(self, numero_sat: str) -> list[dict]:
-        return self._index_sat.get(str(numero_sat).strip(), [])
-
-    def get_by_ecf(self, numero_ecf: str) -> list[dict]:
-        return self._index_ecf.get(str(numero_ecf).strip(), [])
-
-    def get_any(self, numero: str) -> list[dict]:
+        """Retorna todos os movimentos indexados pelo número do cupom.
+        Aceita número com ou sem prefixo '-' (cancelamentos).
         """
-        Tenta todos os índices em ordem: numero → nfce → sat → ecf.
-        Retorna a primeira lista não-vazia encontrada.
-        """
-        for fn in (self.get_by_numero, self.get_by_nfce, self.get_by_sat, self.get_by_ecf):
-            result = fn(numero)
-            if result:
-                return result
-        return []
+        numero = str(numero).strip()
+        # Tenta exato
+        if numero in self._index:
+            return self._index[numero]
+        # Tenta sem prefixo '-'
+        sem_prefixo = numero.lstrip("-")
+        return self._index.get(sem_prefixo, [])
 
     def get_by_eans(self, eans: list[str]) -> list[dict]:
         """
-        Fallback final: movimentos cujos detalles contenham ao menos 1 EAN da lista.
+        Fallback: busca movimentos cujos detalles contenham ao menos um EAN da lista.
+        Usa codigoBarras conforme especificação da API Scanntech.
         """
         results = []
         ean_set = set(eans)
-        for movements in self._index_numero.values():
+        for movements in self._index.values():
             for mov in movements:
-                if ean_set & self._extract_eans(mov):
-                    results.append(mov)
+                mov_eans = self._extract_eans(mov)
+                if any(e in mov_eans for e in ean_set):
+                    if mov not in results:
+                        results.append(mov)
         return results
 
     @staticmethod
     def _extract_eans(movement: dict) -> set[str]:
+        """Extrai EANs do campo detalles usando codigoBarras (API Scanntech oficial)."""
         eans: set[str] = set()
         for item in movement.get("detalles", []):
-            ean = str(item.get("ean", "")).strip()
+            # Campo oficial da API: codigoBarras
+            ean = str(item.get("codigoBarras", item.get("ean", ""))).strip()
             if ean:
                 eans.add(ean)
         return eans
 
     def all_numeros(self) -> list[str]:
-        return list(self._index_numero.keys())
+        """Retorna todos os números de cupom indexados."""
+        return list(self._index.keys())
