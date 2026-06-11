@@ -1,20 +1,31 @@
 """
 Reader da planilha de roteiro de testes.
 
-Regras fixas (alinhadas com o TEMPLATE real):
-  - Linha 7 (row_number=7)  → título / cabeçalho das colunas.
-  - Linha 8 em diante       → linhas de teste (não são sequenciais).
-  - Uma linha é considerada teste válido quando a coluna-índi ce
-    mapeada para "teste" estiver preenchida.
-  - Linhas totalmente vazias e linhas de separador/título de bloco
-    (sem valor na coluna "teste") são ignoradas sem interromper a
-    varredura — o loop NÃO para no primeiro vazio.
-  - O número real da linha na planilha (índi ce Excel 1-based) é
-    preservado no campo "xlsx_row" de cada registro.
+Estrutura real do TEMPLATE:
+  Linha 7  → cabeçalho das colunas.
+  Linha 8+ → linhas de teste (não-sequenciais: podem ter vazios entre elas).
 
-Isoómero de _detect_blocks: como o cabeçalho é FIXO na linha 7,
-  não precisamos mais varrer blocos múltiplos. Mantemos
-  _detect_blocks como fallback caso a linha 7 não case.
+  Colunas de entrada (preenchidas pelo QA antes da execução):
+    A  → Teste (número/id do caso)
+    B  → Tipo Promo
+    C  → Itens da venda
+    D  → Pagamento
+    E  → Observacoes
+    F  → SAT   (número do cupom SAT  — preenchido pelo parceiro ou QA)
+    G  → ECF   (número ECF/COO)
+    H  → NFCE  (número NFC-e)
+    I  → Sub-Total
+    J  → Desconto
+    K  → Total
+    L  → Json  (status da requisição)
+    ...
+
+  Colunas de resultado (preenchidas pelo script):
+    R(18), S(19), T(20) → Ok/Erro por canal (SAT/ECF/NFCE)
+    U(21)               → Justificativa do erro
+
+  Os campos SAT/ECF/NFCE das colunas F/G/H são lidos como
+  número do cupom para busca no Audit e no PDF.
 """
 
 from pathlib import Path
@@ -28,21 +39,25 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 
 COLUMN_ALIASES: Dict[str, List[str]] = {
+    # Identificador do caso de teste
     "teste":           ["teste", "test", "caso", "cenario", "cenário"],
+    # Tipo de promoção
     "tipo_promo":      ["tipo promo", "tipo promocion", "tipo promoção", "tipo_promo"],
-    "numero_cupom":    [
-        "numero", "numero_cupom", "n cupom", "n° cupom", "nº cupom",
-        "num cupom", "número cupom", "n.cupom",
-    ],
+    # Números dos cupons (lidos para busca, não são as colunas de resultado)
+    "numero_sat":      ["sat"],
+    "numero_ecf":      ["ecf"],
+    "numero_nfce":     ["nfce", "nfc-e", "nfc"],
+    # Dados da venda
     "itens_raw":       ["itens da venda", "itens", "articulos", "produtos"],
     "pagamento_raw":   ["pagamento", "pago", "forma de pago", "forma pagamento", "meio pag"],
     "observacoes_raw": ["observacoes", "observações", "obs", "observacion"],
     "subtotal_raw":    ["sub-total", "subtotal", "sub total"],
     "desconto_raw":    ["desconto", "descuento", "desc"],
     "total_raw":       ["total"],
+    "json_status":     ["json"],
+    # EAN e BIN (opcionais)
     "ean_raw":         ["ean", "eans", "codigo_barras", "cod_barra", "ean/upc"],
     "bin_raw":         ["bin"],
-    "promo_ativa_raw": ["promo ativa", "promo_ativa", "ativa"],
 }
 
 # Colunas obrigatórias para validar linha de cabeçalho
@@ -63,12 +78,16 @@ def _norm(value: Any) -> str:
 
 
 def _match_columns(row: List[Any]) -> Dict[str, int]:
-    """Casa a linha com os aliases e retorna mapeamento campo→índiçe."""
+    """
+    Casa a linha de cabeçalho com os aliases.
+    Retorna mapeamento campo → îndiçe 0-based.
+    Retorna {} se as colunas obrigatórias não forem encontradas.
+    """
     normalized = [_norm(c) for c in row]
     mapping: Dict[str, int] = {}
     for internal, aliases in COLUMN_ALIASES.items():
         for i, col in enumerate(normalized):
-            if any(alias in col for alias in aliases):
+            if any(col == alias or alias in col for alias in aliases):
                 if internal not in mapping:
                     mapping[internal] = i
                 break
@@ -94,23 +113,19 @@ def _safe_val(raw) -> Optional[str]:
 
 def _find_header_row(df: pd.DataFrame, preferred_row: int = DEFAULT_HEADER_ROW) -> int:
     """
-    Tenta usar a linha preferred_row (1-based) como cabeçalho.
-    Se não casar com REQUIRED_COLS, faz varredura completa.
-    Retorna o índiçe 0-based do DataFrame.
+    Tenta preferred_row (1-based) primeiro.
+    Fallback: varredura completa.
+    Retorna îndiçe 0-based.
     """
-    preferred_idx = preferred_row - 1  # converte para 0-based
-
+    preferred_idx = preferred_row - 1
     if preferred_idx < len(df):
-        mapping = _match_columns(list(df.iloc[preferred_idx].values))
-        if mapping:
-            print(f"[INFO] Cabeçalho encontrado na linha {preferred_row} (padrão do TEMPLATE).")
+        if _match_columns(list(df.iloc[preferred_idx].values)):
+            print(f"[INFO] Cabeçalho na linha {preferred_row} (padrão do TEMPLATE).")
             return preferred_idx
 
-    # Fallback: varredura linha a linha
     for idx in range(len(df)):
         if _match_columns(list(df.iloc[idx].values)):
-            row_num = idx + 1
-            print(f"[INFO] Cabeçalho detectado por varredura na linha {row_num}.")
+            print(f"[INFO] Cabeçalho detectado por varredura na linha {idx + 1}.")
             return idx
 
     raise ValueError(
@@ -132,34 +147,38 @@ def _extract_test_rows(
     Varre TODAS as linhas abaixo do cabeçalho.
 
     Regras:
-      - NÃÃO para em linha vazia (linhas não são sequenciais).
-      - Inclui a linha somente se o campo "teste" estiver preenchido.
-      - Linhas de separador, título de bloco ou totalmente vazias
-        são simplesmente ignoradas e a varredura continua.
-      - xlsx_row = índiçe 1-based real na planilha (header_idx+1 é a
-        linha do cabeçalho no Excel; a primeira linha de dado é
-        header_idx+2 em 1-based).
+      - NÃO para em linha vazia (suporte a linhas não-sequenciais).
+      - Inclui a linha só se o campo "teste" estiver preenchido.
+      - "xlsx_row" = número real 1-based da linha no Excel.
+      - "numero_cupom" = primeiro número válido encontrado entre
+        SAT → ECF → NFCE (para usar na busca do Audit e PDF).
     """
     rows: List[Dict[str, Any]] = []
     teste_col = col_map["teste"]
 
     for df_idx in range(header_idx + 1, len(df)):
-        row = df.iloc[df_idx]
-        xlsx_row = df_idx + 1  # converte para 1-based (número real no Excel)
+        row        = df.iloc[df_idx]
+        xlsx_row   = df_idx + 1  # 1-based = número real no Excel
 
-        # Linha totalmente vazia → ignora, mas NÃÃO interrompe
         if _is_empty_row(row):
             continue
 
-        # Sem valor na coluna "teste" → linha de título de bloco ou separador
         teste_val = _safe_val(row.iloc[teste_col])
         if not teste_val:
-            continue
+            continue  # linha de separador ou título de bloco
 
-        # Monta registro com todos os campos mapeados
         record: Dict[str, Any] = {"xlsx_row": xlsx_row}
+
+        # Copia todos os campos mapeados
         for field, col_idx in col_map.items():
             record[field] = _safe_val(row.iloc[col_idx])
+
+        # Consolida numero_cupom: SAT > ECF > NFCE
+        record["numero_cupom"] = (
+            record.get("numero_sat")
+            or record.get("numero_ecf")
+            or record.get("numero_nfce")
+        )
 
         rows.append(record)
 
@@ -177,23 +196,28 @@ def load_roteiro_tests(
     """
     Carrega o roteiro e devolve lista de registros no modelo interno.
 
-    Parâmetros
-    ----------
-    path       : caminho do arquivo XLSX
-    header_row : linha de título no Excel (padrão=7, 1-based)
-
-    Retorno
-    -------
-    Lista de dicts, cada um representando um caso de teste.
-    Cada dict contém "xlsx_row" com o número real da linha na planilha.
+    Cada registro contém:
+      - xlsx_row      : número real da linha no Excel (1-based)
+      - numero_cupom  : número consolidado SAT/ECF/NFCE para busca
+      - numero_sat    : valor bruto da coluna SAT
+      - numero_ecf    : valor bruto da coluna ECF
+      - numero_nfce   : valor bruto da coluna NFCE
+      - total_raw, desconto_raw, subtotal_raw, pagamento_raw, observacoes_raw...
     """
-    df = pd.read_excel(path, header=None, dtype=str)
+    df         = pd.read_excel(path, header=None, dtype=str)
     header_idx = _find_header_row(df, preferred_row=header_row)
     col_map    = _match_columns(list(df.iloc[header_idx].values))
 
     rows = _extract_test_rows(df, header_idx, col_map)
 
-    print(f"[INFO] {len(rows)} caso(s) de teste carregado(s) "
-          f"(linhas não-sequenciais suportadas).")
+    print(f"[INFO] {len(rows)} caso(s) de teste carregado(s) ")
+    if rows:
+        sample = rows[0]
+        print(f"  Amostra linha {sample['xlsx_row']}: "
+              f"teste={sample.get('teste')} "
+              f"SAT={sample.get('numero_sat')} "
+              f"ECF={sample.get('numero_ecf')} "
+              f"NFCE={sample.get('numero_nfce')} "
+              f"total={sample.get('total_raw')}")
 
     return rows
