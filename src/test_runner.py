@@ -2,18 +2,22 @@
 Módulo 5 — TestRunner
 Responsabilidade: Orquestra a validação linha a linha do roteiro.
 
-Estratégia de localização do cupom (Check 1)
-============================================
-O roteiro possui TRÊS colunas separadas para o número do cupom físico:
-  • Coluna SAT  (col F) — número do cupom SAT
-  • Coluna ECF  (col G) — número do cupom ECF
-  • Coluna NFCE (col H) — número do cupom NFC-e  ← geralmente preenchido
+Estrutura de checks (em ordem de execução):
+  1. cupom_localizado  — SAT / ECF / NFCE / fallback EANs
+  2. http_200          — _http_status (coluna I do export, injetado pelo AuditParser)
+  3. cancelamento      — campo cancelacion do JSON vs observação do roteiro
+  4. total             — |mov.total − roteiro.total| ≤ R$0,05
+  5. desconto          — |mov.descuentoTotal − roteiro.desconto| ≤ R$0,05
+  6. pagamento         — codigoTipoPago mapeado
+  7. bin               — quando roteiro exige BIN específico
+  8. promocao          — dispatcher por tipo (PromoEngine)
+  9. desconto_manual   — desconto manual indevido quando promo Scanntech ativa
+ 10. schema_json       — campos obrigatórios: total, numero, detalles, pagos
 
-A busca é feita em cascata:
-  1. Tenta SAT  → audit.get_by_numero() + pdf.get_by_numero()
-  2. Tenta ECF  → mesma lógica
-  3. Tenta NFCE → mesma lógica
-  4. Fallback por EANs extraídos da coluna 'Itens da venda'
+Nota sobre _http_status:
+  O AuditParser lê o status HTTP da coluna I do export Audit e o injeta
+  no dicionário do movimento como chave "_http_status". O Check 2 lê
+  exclusivamente essa chave — nunca tenta extrair o status do JSON do Request.
 """
 
 import logging
@@ -30,36 +34,33 @@ logger = logging.getLogger(__name__)
 TOLERANCE = 0.05
 
 # ---------------------------------------------------------------------------
-# Aliases de colunas do roteiro (case-insensitive, strip)
+# Aliases de colunas do roteiro (case-insensitive)
 # ---------------------------------------------------------------------------
 
-# Número do cupom — coluna genérica (legado) OU colunas separadas SAT/ECF/NFCE
-_ALIAS_SAT  = ["sat", "num. sat", "numero sat", "nº sat", "n° sat", "cupom sat"]
-_ALIAS_ECF  = ["ecf", "num. ecf", "numero ecf", "nº ecf", "n° ecf", "cupom ecf"]
-_ALIAS_NFCE = [
+_ALIAS_SAT    = ["sat", "num. sat", "numero sat", "nº sat", "n° sat", "cupom sat"]
+_ALIAS_ECF    = ["ecf", "num. ecf", "numero ecf", "nº ecf", "n° ecf", "cupom ecf"]
+_ALIAS_NFCE   = [
     "nfce", "nfc-e", "nfce.1", "num. nfce", "numero nfce", "nº nfce",
     "o de\nnfce", "o de nfce", "numero de\nnfce", "n. nfce", "cupom nfce",
     "numero nfc-e", "nfc_e",
 ]
-# Coluna genérica (roteiros mais antigos)
 _ALIAS_NUMERO = [
     "numero_cupom", "n° cupom", "nº cupom", "cupom", "numero",
     "n cupom", "num cupom", "número cupom", "n.cupom", "num.cupom", "número",
 ]
-
-_ALIAS_EANS  = ["ean", "eans", "itens da venda", "articulos movimiento",
-                "codigo_barras", "cod_barra", "codigo barras", "ean/upc",
-                "itens", "produtos", "artigos"]
-_ALIAS_TOTAL = ["total", "valor total", "vl total", "vl. total", "total venda"]
-_ALIAS_DESC  = ["desconto", "desc", "desconto total", "vl desconto",
-                "descuento", "acréscimo", "acrescimo"]
-_ALIAS_PAGO  = ["meio_pagamento", "meio pagamento", "pagamento",
-                "forma pagamento", "forma de pagamento", "tipo pagamento", "meio pag"]
-_ALIAS_OBS   = ["observacao", "observação", "obs", "observacoes", "observações",
-                "detalhes", "nota", "observacoes.1"]
-_ALIAS_ETAPA = ["etapa", "fase", "step", "cenário", "cenario", "teste"]
-_ALIAS_TIPO  = ["tipo promo", "tipo_promo", "tipopromo", "tipo de promo",
-                "tipo promocao", "tipo promoção", "promo"]
+_ALIAS_EANS   = ["ean", "eans", "itens da venda", "articulos movimiento",
+                 "codigo_barras", "cod_barra", "codigo barras", "ean/upc",
+                 "itens", "produtos", "artigos"]
+_ALIAS_TOTAL  = ["total", "valor total", "vl total", "vl. total", "total venda"]
+_ALIAS_DESC   = ["desconto", "desc", "desconto total", "vl desconto",
+                 "descuento", "acréscimo", "acrescimo"]
+_ALIAS_PAGO   = ["meio_pagamento", "meio pagamento", "pagamento",
+                 "forma pagamento", "forma de pagamento", "tipo pagamento", "meio pag"]
+_ALIAS_OBS    = ["observacao", "observação", "obs", "observacoes", "observações",
+                 "detalhes", "nota", "observacoes.1"]
+_ALIAS_ETAPA  = ["etapa", "fase", "step", "cenário", "cenario", "teste"]
+_ALIAS_TIPO   = ["tipo promo", "tipo_promo", "tipopromo", "tipo de promo",
+                 "tipo promocao", "tipo promoção", "promo"]
 
 
 def _get(row: dict, aliases: list, default=None):
@@ -76,7 +77,6 @@ def _clean_numero(raw) -> str:
     """Normaliza o número do cupom: strip, remove None/nan, converte float→int."""
     if raw is None:
         return ""
-    # openpyxl pode retornar float para células numéricas (ex: 79.0)
     if isinstance(raw, float):
         raw = int(raw) if raw == int(raw) else raw
     s = str(raw).strip()
@@ -84,10 +84,7 @@ def _clean_numero(raw) -> str:
 
 
 def _extract_eans_from_text(text: str) -> list[str]:
-    """
-    Extrai EANs (7-14 dígitos) do texto livre da coluna 'Itens da venda'.
-    Ex: '2 x 7891000010860 + 3.579 * PESABLE' → ['7891000010860']
-    """
+    """Extrai EANs (7–14 dígitos) do texto livre da coluna 'Itens da venda'."""
     return re.findall(r'\b(\d{7,14})\b', str(text or ""))
 
 
@@ -131,7 +128,7 @@ class TestRunner:
         self.promo = promo
 
     # ------------------------------------------------------------------
-    # Localização do cupom — lógica centralizada
+    # Localização do cupom
     # ------------------------------------------------------------------
 
     def _locate_coupon(
@@ -139,17 +136,16 @@ class TestRunner:
     ) -> tuple[Optional[Coupon], list[dict], str]:
         """
         Tenta localizar o cupom na ordem:
-          1. Coluna NFCE  (col H — mais preenchida na Etapa 1)
-          2. Coluna SAT   (col F)
-          3. Coluna ECF   (col G)
-          4. Campo genérico 'numero_cupom' (legado)
-          5. Fallback por EANs extraídos do texto 'Itens da venda'
+          1. NFCE  (col H — mais preenchida)
+          2. SAT   (col F)
+          3. ECF   (col G)
+          4. Campo genérico 'numero_cupom'
+          5. Fallback por EANs
         """
         coupon: Optional[Coupon] = None
         movements: list[dict] = []
         resolved: str = ""
 
-        # Candidatos de número na ordem de prioridade
         candidatos = [
             ("NFCE", _clean_numero(_get(row, _ALIAS_NFCE))),
             ("SAT",  _clean_numero(_get(row, _ALIAS_SAT))),
@@ -172,11 +168,10 @@ class TestRunner:
                 coupon    = coupon or cup
                 movements = movements or movs
                 resolved  = resolved or numero
-                # Não para: pode ter PDF num e Audit noutro
                 if coupon and movements:
                     break
 
-        # --- Fallback por EANs ---
+        # Fallback por EANs
         itens_texto = str(_get(row, _ALIAS_EANS, "") or "")
         eans = _extract_eans_from_text(itens_texto)
 
@@ -184,13 +179,11 @@ class TestRunner:
             coupon = self.pdf.get_by_eans(eans)
             if coupon:
                 resolved = resolved or coupon.get_numero() or ""
-                logger.debug("PDF localizado via EANs: %s", eans)
 
         if not movements and eans:
             movements = self.audit.get_by_eans(eans)
             if movements:
                 resolved = resolved or str(movements[0].get("numero", ""))
-                logger.debug("Audit localizado via EANs: %s", eans)
 
         return coupon, movements, resolved
 
@@ -207,11 +200,8 @@ class TestRunner:
         found = coupon is not None or len(movements) > 0
         result.cupom_numero = resolved or None
 
-        # Reconstrói EANs para log de erro
         itens_texto = str(_get(row, _ALIAS_EANS, "") or "")
         eans = _extract_eans_from_text(itens_texto)
-
-        # Candidatos para mensagem de erro
         num_nfce = _clean_numero(_get(row, _ALIAS_NFCE))
         num_sat  = _clean_numero(_get(row, _ALIAS_SAT))
         num_ecf  = _clean_numero(_get(row, _ALIAS_ECF))
@@ -230,11 +220,14 @@ class TestRunner:
         mov = movements[0] if movements else {}
 
         # --- Check 2: HTTP 200 ---
-        status  = int(mov.get("status", mov.get("httpStatus", 0)))
+        # _http_status é injetado pelo AuditParser a partir da coluna I do export.
+        # NUNCA tenta ler o status de dentro do JSON do Request (coluna S),
+        # pois o JSON é o corpo da requisição enviada, não a resposta.
+        status  = int(mov.get("_http_status", 0))
         ok_http = status == 200
         result.checks.append(CheckResult(
             "http_200", ok_http,
-            "" if ok_http else f"Status HTTP: {status}"
+            "" if ok_http else f"Status HTTP: {status} (esperado 200)"
         ))
 
         # --- Check 3: Cancelamento ---
