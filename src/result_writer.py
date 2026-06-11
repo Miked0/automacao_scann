@@ -34,9 +34,6 @@ FILL_NONE = PatternFill()
 
 # ---------------------------------------------------------------------------
 # KEYWORDS_HEADER: palavras que identificam a linha de cabeçalho do roteiro.
-# IMPORTANTE: devem ser exclusivas da linha de cabeçalho — evitar palavras
-# genéricas como "tipo", "total", "obs" que podem aparecer em linhas de
-# título ou apresentação do template (linhas 1-6).
 # ---------------------------------------------------------------------------
 KEYWORDS_HEADER = {
     "nº do teste",
@@ -75,47 +72,78 @@ _DEFAULT_COLS = {
     "col_just": 21,  # U
 }
 
+# ---------------------------------------------------------------------------
 # Linha de cabeçalho esperada no TEMPLATE (1-based).
 # O template Scanntech tem cabeçalho fixo na linha 7.
+# A varredura automática NUNCA pesquisa abaixo desta linha,
+# evitando falsos positivos em títulos das linhas 1-6.
+# ---------------------------------------------------------------------------
 _EXPECTED_HEADER_ROW = 7
+
+# Número mínimo de células com keyword para confirmar que é a linha de cabeçalho
+_MIN_KEYWORD_HITS = 2
 
 
 # ---------------------------------------------------------------------------
 # Helpers de detecção
 # ---------------------------------------------------------------------------
 
+def _row_keyword_hits(ws, row_num: int) -> int:
+    """Conta quantas células da linha contêm alguma KEYWORD_HEADER."""
+    hits = 0
+    for cell in ws[row_num]:
+        if cell.value and any(
+            kw in str(cell.value).strip().lower() for kw in KEYWORDS_HEADER
+        ):
+            hits += 1
+    return hits
+
+
 def _detect_header_row(ws) -> int:
     """
     Detecta a linha de cabeçalho com estratégia em três passos:
 
-    1. Verifica se a linha _EXPECTED_HEADER_ROW (7) possui ao menos uma
-       célula com palavra-chave exclusiva do cabeçalho → usa ela.
-    2. Varre todas as linhas buscando palavras-chave exclusivas.
+    1. Verifica se a linha _EXPECTED_HEADER_ROW (7) possui ao menos
+       _MIN_KEYWORD_HITS (2) células com keyword → usa ela.
+    2. Varre SOMENTE a partir de _EXPECTED_HEADER_ROW (nunca antes),
+       exigindo ao menos _MIN_KEYWORD_HITS hits para confirmar.
     3. Fallback: retorna _EXPECTED_HEADER_ROW (7) incondicionalmente.
 
-    Evita falsos positivos de palavras genéricas (ex: "total", "tipo")
-    que podem existir nas linhas de título/apresentação (1-6).
+    A restrição "nunca antes de _EXPECTED_HEADER_ROW" evita que palavras
+    genéricas nas linhas de título/apresentação (1-6) causem falsos positivos
+    que deslocariam o início do processamento para linhas erradas (ex: linha 4).
     """
-    # Passo 1: verifica linha esperada
-    for cell in ws[_EXPECTED_HEADER_ROW]:
-        if cell.value and any(
-            kw in str(cell.value).strip().lower() for kw in KEYWORDS_HEADER
-        ):
-            logger.debug("Cabeçalho confirmado na linha esperada %d", _EXPECTED_HEADER_ROW)
-            return _EXPECTED_HEADER_ROW
+    # Passo 1: verifica linha esperada com threshold de hits
+    hits = _row_keyword_hits(ws, _EXPECTED_HEADER_ROW)
+    if hits >= _MIN_KEYWORD_HITS:
+        logger.info(
+            "Cabeçalho confirmado na linha esperada %d (%d hits)",
+            _EXPECTED_HEADER_ROW, hits
+        )
+        return _EXPECTED_HEADER_ROW
 
-    # Passo 2: varredura completa
-    for row in ws.iter_rows():
-        for cell in row:
-            if cell.value and any(
-                kw in str(cell.value).strip().lower() for kw in KEYWORDS_HEADER
-            ):
-                logger.info("Cabeçalho encontrado por varredura na linha %d", cell.row)
-                return cell.row
+    # Passo 1b: linha esperada tem pelo menos 1 hit → aceita mesmo assim
+    if hits == 1:
+        logger.info(
+            "Cabeçalho aceito na linha esperada %d (1 hit — threshold relaxado)",
+            _EXPECTED_HEADER_ROW
+        )
+        return _EXPECTED_HEADER_ROW
+
+    # Passo 2: varredura a partir de _EXPECTED_HEADER_ROW (nunca antes)
+    max_row = ws.max_row or 0
+    for row_num in range(_EXPECTED_HEADER_ROW, max_row + 1):
+        h = _row_keyword_hits(ws, row_num)
+        if h >= _MIN_KEYWORD_HITS:
+            logger.info(
+                "Cabeçalho encontrado por varredura na linha %d (%d hits)",
+                row_num, h
+            )
+            return row_num
 
     # Passo 3: fallback fixo
     logger.warning(
-        "Cabeçalho não detectado por palavras-chave. Usando linha fixa %d.",
+        "Cabeçalho não detectado. Usando linha fixa %d como fallback.",
         _EXPECTED_HEADER_ROW
     )
     return _EXPECTED_HEADER_ROW
