@@ -9,7 +9,7 @@ Mapeamento de colunas de resultado (fixo, conforme TEMPLATE real):
   U (21) → justificativa do erro
 
 O script detecta as colunas pelo cabeçalho dinamicamente.
-Se não encontrar, usa os îndicadores fixos acima como fallback.
+Se não encontrar, usa os indicadores fixos acima como fallback.
 
 Regra de escrita:
   - Escreve Ok/Erro + fill verde/vermelho nas 3 colunas de status.
@@ -32,6 +32,32 @@ FILL_OK   = PatternFill("solid", fgColor="C6EFCE")
 FILL_ERRO = PatternFill("solid", fgColor="FFC7CE")
 FILL_NONE = PatternFill()
 
+# ---------------------------------------------------------------------------
+# KEYWORDS_HEADER: palavras que identificam a linha de cabeçalho do roteiro.
+# IMPORTANTE: devem ser exclusivas da linha de cabeçalho — evitar palavras
+# genéricas como "tipo", "total", "obs" que podem aparecer em linhas de
+# título ou apresentação do template (linhas 1-6).
+# ---------------------------------------------------------------------------
+KEYWORDS_HEADER = {
+    "nº do teste",
+    "n. do teste",
+    "no. do teste",
+    "numero do teste",
+    "número do teste",
+    "num. sat",
+    "num. ecf",
+    "num. nfce",
+    "nº sat",
+    "nº ecf",
+    "nº nfce",
+    "nfce",
+    "itens da venda",
+    "articulos movimiento",
+    "tipo promo",
+    "tipo de promo",
+    "tipo promoción",
+}
+
 # Palavras-chave para detectar as colunas de resultado no cabeçalho
 _RESULT_COL_KEYWORDS = {
     "col_sat":  ["resultado sat",  "res sat",  "result sat",  "ok sat",  "erro sat"],
@@ -49,32 +75,56 @@ _DEFAULT_COLS = {
     "col_just": 21,  # U
 }
 
-KEYWORDS_HEADER = {"teste", "tipo", "promo", "roteiro", "etapa", "descricao", "total"}
+# Linha de cabeçalho esperada no TEMPLATE (1-based).
+# O template Scanntech tem cabeçalho fixo na linha 7.
+_EXPECTED_HEADER_ROW = 7
 
 
 # ---------------------------------------------------------------------------
 # Helpers de detecção
 # ---------------------------------------------------------------------------
 
-def _detect_header_row(ws, fixed_row: int = 7) -> int:
+def _detect_header_row(ws) -> int:
     """
-    Usa a linha fixa (padrão=7) se tiver conteúdo.
-    Fallback: varredura por palavras-chave.
+    Detecta a linha de cabeçalho com estratégia em três passos:
+
+    1. Verifica se a linha _EXPECTED_HEADER_ROW (7) possui ao menos uma
+       célula com palavra-chave exclusiva do cabeçalho → usa ela.
+    2. Varre todas as linhas buscando palavras-chave exclusivas.
+    3. Fallback: retorna _EXPECTED_HEADER_ROW (7) incondicionalmente.
+
+    Evita falsos positivos de palavras genéricas (ex: "total", "tipo")
+    que podem existir nas linhas de título/apresentação (1-6).
     """
-    row = ws[fixed_row]
-    if any(c.value for c in row):
-        return fixed_row
+    # Passo 1: verifica linha esperada
+    for cell in ws[_EXPECTED_HEADER_ROW]:
+        if cell.value and any(
+            kw in str(cell.value).strip().lower() for kw in KEYWORDS_HEADER
+        ):
+            logger.debug("Cabeçalho confirmado na linha esperada %d", _EXPECTED_HEADER_ROW)
+            return _EXPECTED_HEADER_ROW
+
+    # Passo 2: varredura completa
     for row in ws.iter_rows():
         for cell in row:
-            if cell.value and any(kw in str(cell.value).lower() for kw in KEYWORDS_HEADER):
+            if cell.value and any(
+                kw in str(cell.value).strip().lower() for kw in KEYWORDS_HEADER
+            ):
+                logger.info("Cabeçalho encontrado por varredura na linha %d", cell.row)
                 return cell.row
-    return 7
+
+    # Passo 3: fallback fixo
+    logger.warning(
+        "Cabeçalho não detectado por palavras-chave. Usando linha fixa %d.",
+        _EXPECTED_HEADER_ROW
+    )
+    return _EXPECTED_HEADER_ROW
 
 
 def _find_result_cols(ws, header_row: int) -> dict:
     """
-    Tenta localizar as colunas de resultado pelo cabeçalho.
-    Retorna dict col_sat/col_ecf/col_nfce/col_just com îndicadores 1-based.
+    Localiza as colunas de resultado pelo cabeçalho.
+    Retorna dict col_sat/col_ecf/col_nfce/col_just com indicadores 1-based.
     Usa _DEFAULT_COLS como fallback.
     """
     found = {}
@@ -86,7 +136,6 @@ def _find_result_cols(ws, header_row: int) -> dict:
             if key not in found and any(kw in val for kw in keywords):
                 found[key] = cell.column
 
-    # Aplica fallback para colunas não encontradas
     for key, default_col in _DEFAULT_COLS.items():
         if key not in found:
             found[key] = default_col
@@ -144,13 +193,12 @@ def _safe_write(ws, row: int, col: int, value, fill) -> None:
 class ResultWriter:
     """Escreve resultados nas colunas corretas do TEMPLATE e salva o xlsx."""
 
-    def __init__(self, workbook: openpyxl.Workbook, output_path: str,
-                 header_row: int = 7):
+    def __init__(self, workbook: openpyxl.Workbook, output_path: str):
         self.wb          = workbook
         self.output_path = Path(output_path)
         self.ws          = workbook.active
 
-        self.header_row = _detect_header_row(self.ws, fixed_row=header_row)
+        self.header_row = _detect_header_row(self.ws)
         cols            = _find_result_cols(self.ws, self.header_row)
 
         self.col_sat  = cols["col_sat"]
@@ -159,12 +207,10 @@ class ResultWriter:
         self.col_just = cols["col_just"]
 
         logger.info(
-            "ResultWriter: resultado SAT=col%d ECF=col%d NFCE=col%d JUST=col%d "
-            "(cabeçalho linha %d)",
+            "ResultWriter: SAT=col%d ECF=col%d NFCE=col%d JUST=col%d (header linha %d)",
             self.col_sat, self.col_ecf, self.col_nfce, self.col_just, self.header_row
         )
 
-        # Desfaz merges que bloqueiam a escrita nas colunas de resultado
         result_cols = {self.col_sat, self.col_ecf, self.col_nfce, self.col_just}
         _preemptive_unmerge(self.ws, result_cols)
 
