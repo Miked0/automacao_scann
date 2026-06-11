@@ -1,6 +1,20 @@
 """
 Módulo 1 — FileLoader
 Responsabilidade: Valida existência e carrega todos os artefatos.
+
+Planilhas suportadas:
+  - TEMPLATE_COM_BIN_NOVO.xlsx  (3 etapas, com validação BIN ELO)
+  - TEMPLATE_SEM_BIN_NOVO.xlsx  (3 etapas, sem BIN)
+
+Estrutura da aba de testes (cabeçalho detectado dinamicamente):
+  Teste | Tipo Promo | Items | Pagamento | Observacoes | SAT | ECF | NFCE |
+  Sub-Total | Desconto | Total | Json | Minoristas | Cupom | Observacoes
+
+Colunas de resultado (preenchidas pelo script):
+  Json        → Ok/Erro (verde/vermelho)
+  Minoristas  → Ok/Erro
+  Cupom       → Ok/Erro
+  Observacoes → justificativa ≤100 chars
 """
 
 import logging
@@ -49,16 +63,26 @@ class FileLoader:
             raise FileNotFoundError(f"Diretório JSON não encontrado: {self.json_dir}")
 
     # ------------------------------------------------------------------
-    # Carregamento individual
+    # Carregamento
     # ------------------------------------------------------------------
 
     def load_roteiro(self) -> openpyxl.Workbook:
-        """Carrega o TEMPLATE xlsx em modo data_only=True (preserva valores calculados)."""
+        """
+        Carrega o TEMPLATE xlsx em modo data_only=True.
+        Preserva valores calculados sem reavaliar fórmulas.
+        Compatível com TEMPLATE_COM_BIN_NOVO e TEMPLATE_SEM_BIN_NOVO.
+        """
         logger.info("Carregando roteiro: %s", self.roteiro_path)
-        return openpyxl.load_workbook(self.roteiro_path, data_only=True)
+        wb = openpyxl.load_workbook(self.roteiro_path, data_only=True)
+        logger.info("Abas encontradas: %s", wb.sheetnames)
+        return wb
 
     def load_audit(self) -> pd.DataFrame:
-        """Carrega o export Audit como DataFrame, priorizando a aba AUDIT_TICKETS."""
+        """
+        Carrega o export Audit como DataFrame.
+        Tenta a aba AUDIT_TICKETS; fallback para a primeira aba.
+        O campo 'Request' contém o JSON da venda com aspas escapadas como "".
+        """
         logger.info("Carregando audit: %s", self.audit_path)
         try:
             df = pd.read_excel(self.audit_path, sheet_name="AUDIT_TICKETS")
@@ -68,10 +92,13 @@ class FileLoader:
         logger.info("Audit carregado: %d linhas", len(df))
         return df
 
-    def load_pdf_text_blocks(self) -> list[str]:
-        """Extrai texto bruto do PDF e retorna lista de páginas."""
+    def load_pdf_text_blocks(self) -> list:
+        """
+        Extrai texto bruto do PDF página a página.
+        O CouponPDFParser faz o split em blocos de cupom.
+        """
         logger.info("Carregando PDF: %s", self.pdf_path)
-        pages: list[str] = []
+        pages = []
         with pdfplumber.open(self.pdf_path) as pdf:
             for i, page in enumerate(pdf.pages):
                 text = page.extract_text() or ""
@@ -80,7 +107,7 @@ class FileLoader:
         logger.info("PDF carregado: %d páginas", len(pages))
         return pages
 
-    def list_json_files(self) -> list[Path]:
+    def list_json_files(self) -> list:
         """Lista arquivos JSON no diretório opcional."""
         if not self.json_dir:
             return []
@@ -88,16 +115,8 @@ class FileLoader:
         logger.info("JSON dir: %d arquivos encontrados", len(files))
         return files
 
-    # ------------------------------------------------------------------
-    # Carregamento unificado
-    # ------------------------------------------------------------------
-
     def load_all(self) -> dict:
-        """Valida e carrega todos os artefatos de uma vez.
-
-        Returns:
-            dict com chaves: workbook, audit_df, pdf_pages, json_files
-        """
+        """Valida e carrega todos os artefatos de uma vez."""
         self.validate_paths()
         return {
             "workbook":   self.load_roteiro(),
