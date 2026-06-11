@@ -2,13 +2,13 @@
 Módulo 6 — ResultWriter
 Responsabilidade: Preenche colunas de resultado + salva xlsx.
 
-Fix v3:
-  - _safe_write com captura de AttributeError como fallback duplo:
-    1) tenta _unmerge_cell + escrita normal
-    2) se ainda AttributeError, força ws.unmerge_cells no intervalo inteiro
-       e repete a escrita na célula âncora do merge
-  - _find_col_by_keyword: resolve MergedCell no cabeçalho lendo valor da
-    âncora quando cell.value é None
+Fix v4 — Abordagem definitiva para MergedCell read-only:
+  - No __init__, varre TODOS os merged ranges da planilha e desfaz
+    qualquer um que toque nas colunas de resultado (col_sat/ecf/nfce/just).
+  - Isso elimina o erro AttributeError antes de qualquer escrita, pois
+    o openpyxl não permite escrever em MergedCell proxy mesmo após
+    unmerge_cells chamado line-by-line.
+  - _safe_write mantida como segunda linha de defesa.
 """
 
 import logging
@@ -17,7 +17,7 @@ from typing import Optional
 
 import openpyxl
 from openpyxl.styles import PatternFill
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import get_column_letter, column_index_from_string
 
 from .test_runner import TestResult
 
@@ -25,12 +25,16 @@ logger = logging.getLogger(__name__)
 
 FILL_OK   = PatternFill("solid", fgColor="C6EFCE")
 FILL_ERRO = PatternFill("solid", fgColor="FFC7CE")
+FILL_NONE = PatternFill()
 
 KEYWORDS_HEADER = {"teste", "tipo", "promo", "roteiro", "etapa", "descricao"}
 
 
+# ---------------------------------------------------------------------------
+# Helpers de detecção
+# ---------------------------------------------------------------------------
+
 def _detect_header_row(ws) -> int:
-    """Detecta a linha de cabeçalho por palavras-chave."""
     for row in ws.iter_rows():
         for cell in row:
             if cell.value and any(
@@ -43,14 +47,13 @@ def _detect_header_row(ws) -> int:
 def _find_col_by_keyword(ws, header_row: int, keywords: list) -> Optional[int]:
     """
     Encontra índice da coluna pelo cabeçalho.
-    Resolve MergedCell: quando cell.value é None mas a célula faz parte de
-    um merge, busca o valor na âncora do merge.
+    Resolve MergedCell: lê valor da âncora quando cell.value é None.
     """
-    # Monta mapa col_index -> valor_real resolvendo merges
     col_val: dict[int, str] = {}
     for cell in ws[header_row]:
-        if cell.value is not None:
-            col_val[cell.column] = str(cell.value).lower()
+        val = cell.value
+        if val is not None:
+            col_val[cell.column] = str(val).lower()
 
     for mr in ws.merged_cells.ranges:
         if mr.min_row <= header_row <= mr.max_row:
@@ -65,65 +68,69 @@ def _find_col_by_keyword(ws, header_row: int, keywords: list) -> Optional[int]:
     return None
 
 
-def _find_merged_range(ws, row: int, col: int):
-    """Retorna o MergedCellRange que contém (row, col), ou None."""
-    col_letter = get_column_letter(col)
-    cell_coord = f"{col_letter}{row}"
-    for mr in ws.merged_cells.ranges:
-        if cell_coord in mr:
-            return mr
-    return None
+# ---------------------------------------------------------------------------
+# Unmerge preventivo global
+# ---------------------------------------------------------------------------
 
-
-def _unmerge_cell(ws, row: int, col: int) -> None:
+def _preemptive_unmerge(ws, result_cols: set[int]) -> None:
     """
-    Se a célula (row, col) faz parte de um intervalo mesclado,
-    desfaz o merge preservando o valor da âncora.
+    Varre todos os merged ranges e desfaz aqueles que contêm
+    qualquer coluna em result_cols.  Deve ser chamado UMA VEZ
+    no __init__ antes de qualquer escrita.
     """
-    mr = _find_merged_range(ws, row, col)
-    if mr is None:
-        return
-    anchor = ws.cell(row=mr.min_row, column=mr.min_col)
-    saved_val  = anchor.value
-    saved_fill = anchor.fill
-    ws.unmerge_cells(str(mr))
-    anchor.value = saved_val
-    anchor.fill  = saved_fill
-    logger.debug("Unmerge aplicado: %s (linha %d col %d)", mr, row, col)
+    # Snapshot da lista (ws.merged_cells.ranges muda durante iteração)
+    ranges_to_remove = []
+    for mr in list(ws.merged_cells.ranges):
+        if any(mr.min_col <= c <= mr.max_col for c in result_cols):
+            ranges_to_remove.append(str(mr))
 
+    for coord in ranges_to_remove:
+        try:
+            # Preserva valor da âncora
+            parts = coord.replace(":", " ").split()
+            # get_column_letter inverso: extrai col âncora
+            anchor_coord = parts[0]
+            anchor = ws[anchor_coord]
+            saved_val  = anchor.value if not isinstance(anchor, openpyxl.cell.cell.MergedCell) else None
+            ws.unmerge_cells(coord)
+            # Reescreve o valor na âncora (agora célula normal)
+            try:
+                ws[anchor_coord].value = saved_val
+            except Exception:
+                pass
+            logger.debug("Pre-unmerge: %s", coord)
+        except Exception as e:
+            logger.warning("Falha ao desfazer merge %s: %s", coord, e)
+
+
+# ---------------------------------------------------------------------------
+# Escrita segura (segunda linha de defesa)
+# ---------------------------------------------------------------------------
 
 def _safe_write(ws, row: int, col: int, value, fill) -> None:
-    """
-    Escreve value/fill na célula (row, col).
-
-    Estratégia em 3 camadas:
-    1) Desfaz merge se necessário e escreve normalmente.
-    2) Se AttributeError (MergedCell proxy remanescente), força unmerge
-       do range inteiro e escreve na âncora.
-    3) Loga warning se ainda falhar.
-    """
-    _unmerge_cell(ws, row, col)
     try:
         cell = ws.cell(row=row, column=col)
         cell.value = value
         cell.fill  = fill
-        return
     except AttributeError:
-        logger.debug("AttributeError na escrita (%d,%d) — tentando fallback", row, col)
+        # Ainda é MergedCell? Força unmerge pontual e tenta de novo.
+        col_letter = get_column_letter(col)
+        for mr in list(ws.merged_cells.ranges):
+            if mr.min_col <= col <= mr.max_col and mr.min_row <= row <= mr.max_row:
+                ws.unmerge_cells(str(mr))
+                logger.debug("Unmerge pontual: %s", mr)
+                break
+        try:
+            cell = ws.cell(row=row, column=col)
+            cell.value = value
+            cell.fill  = fill
+        except AttributeError as e:
+            logger.warning("Não foi possível escrever em (%d,%d): %s", row, col, e)
 
-    # Fallback: localiza e desfaz qualquer merge residual
-    mr = _find_merged_range(ws, row, col)
-    if mr:
-        ws.unmerge_cells(str(mr))
-        logger.debug("Fallback unmerge: %s", mr)
 
-    try:
-        cell = ws.cell(row=row, column=col)
-        cell.value = value
-        cell.fill  = fill
-    except AttributeError as e:
-        logger.warning("Não foi possível escrever em (%d,%d): %s", row, col, e)
-
+# ---------------------------------------------------------------------------
+# ResultWriter
+# ---------------------------------------------------------------------------
 
 class ResultWriter:
     """Escreve resultados nas colunas corretas do TEMPLATE e salva o xlsx."""
@@ -160,8 +167,12 @@ class ResultWriter:
             self.col_sat, self.col_ecf, self.col_nfce, self.col_just
         )
 
+        # ── FIX v4: desfaz TODOS os merges que tocam nas colunas de resultado ──
+        result_cols = {c for c in (self.col_sat, self.col_ecf, self.col_nfce, self.col_just) if c}
+        _preemptive_unmerge(self.ws, result_cols)
+
     def write_result(self, result: TestResult, data_row: int) -> None:
-        """Preenche as colunas de resultado, desfazendo merges se necessário."""
+        """Preenche as colunas de resultado para uma linha de dado."""
         status = "Ok"    if result.passed else "Erro"
         fill   = FILL_OK if result.passed else FILL_ERRO
 
@@ -171,7 +182,7 @@ class ResultWriter:
 
         if self.col_just:
             motivo = result.motivo_erro if not result.passed else ""
-            _safe_write(self.ws, data_row, self.col_just, motivo, PatternFill())
+            _safe_write(self.ws, data_row, self.col_just, motivo, FILL_NONE)
 
     def save(self) -> None:
         """Salva o workbook no caminho de saída."""
