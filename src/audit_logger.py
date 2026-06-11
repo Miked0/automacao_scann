@@ -1,63 +1,88 @@
 """
-M7 — AuditLogger
-Gera o log JSON estruturado (qa_audit_log.json) com uma entrada por teste,
-contendo: etapa, linha, cupons utilizados, lista de checks {check, ok, detalhe}
-e motivo de erro.
+Módulo 7 — AuditLogger
+Responsabilidade: Gera log JSON estruturado de cada check.
 """
 
-from __future__ import annotations
 import json
 import logging
-import os
-from typing import List
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional
 
-from .models import TestResult
-
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class AuditLogger:
-    """Serializa TestResults em um arquivo JSON estruturado."""
+    """Registra cada execução de teste em log JSON estruturado."""
 
-    def __init__(self, output_path: str) -> None:
-        self.output_path = output_path
+    def __init__(self, log_path: str):
+        self.log_path  = Path(log_path)
+        self._entries: list[dict] = []
 
-    def write(self, results: List[TestResult]) -> None:
-        entries = [self._serialize(r) for r in results]
-        summary = {
-            "total":    len(results),
-            "ok":       sum(1 for r in results if r.overall_ok),
-            "erro":     sum(1 for r in results if not r.overall_ok),
-        }
-        payload = {"summary": summary, "results": entries}
+    # ------------------------------------------------------------------
+    # Interface pública chamada pelo orquestrador
+    # ------------------------------------------------------------------
 
-        os.makedirs(os.path.dirname(os.path.abspath(self.output_path)), exist_ok=True)
-        with open(self.output_path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False, indent=2)
+    def write(self, results: list) -> None:
+        """
+        Alias público compatível com o orquestrador:
+            audit_logger.write(results)
+        Registra todos os TestResult e persiste o JSON.
+        """
+        for result in results:
+            self.record(result)
+        self.flush()
 
-        log.info(
-            "AuditLogger: %d entradas salvas em %s. OK=%d ERRO=%d",
-            len(results),
-            self.output_path,
-            summary["ok"],
-            summary["erro"],
-        )
+    # ------------------------------------------------------------------
+    # API granular (para uso direto ou testes)
+    # ------------------------------------------------------------------
 
-    @staticmethod
-    def _serialize(r: TestResult) -> dict:
-        return {
-            "etapa":         r.etapa,
-            "linha":         r.linha,
-            "cupom_key":     r.cupom_key,
-            "coupons_used":  r.coupons_used,
-            "overall_ok":    r.overall_ok,
-            "error_reason":  r.error_reason,
+    def record(self, result, cupons_utilizados: Optional[list] = None) -> None:
+        """Adiciona entrada de um teste ao log em memória."""
+        # Suporte a TestResult com atributo overall_ok (novo) ou passed (legado)
+        passou = getattr(result, "overall_ok", None)
+        if passou is None:
+            passou = getattr(result, "passed", False)
+
+        motivo = getattr(result, "error_reason", None) or getattr(result, "motivo_erro", "")
+
+        entry = {
+            "timestamp":         datetime.now().isoformat(),
+            "etapa":             getattr(result, "etapa", ""),
+            "linha":             getattr(result, "linha", 0),
+            "cupom_numero":      getattr(result, "cupom_numero",  None)
+                                  or getattr(result, "cupom_key", None),
+            "cupons_utilizados": cupons_utilizados
+                                  or getattr(result, "coupons_used", []),
+            "passou":            passou,
+            "motivo_erro":       motivo,
             "checks": [
                 {
                     "check":   c.check,
                     "ok":      c.ok,
                     "detalhe": c.detalhe,
                 }
-                for c in r.checks
+                for c in getattr(result, "checks", [])
             ],
+        }
+        self._entries.append(entry)
+
+    def flush(self) -> None:
+        """Persiste todos os registros no arquivo JSON."""
+        with open(self.log_path, "w", encoding="utf-8") as f:
+            json.dump(self._entries, f, ensure_ascii=False, indent=2)
+        logger.info(
+            "AuditLogger: %d entradas salvas em %s",
+            len(self._entries), self.log_path,
+        )
+
+    def summary(self) -> dict:
+        """Retorna um resumo estatístico da execução."""
+        total  = len(self._entries)
+        passou = sum(1 for e in self._entries if e["passou"])
+        return {
+            "total":  total,
+            "passou": passou,
+            "falhou": total - passou,
+            "pct_ok": round((passou / total * 100) if total else 0, 1),
         }

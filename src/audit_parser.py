@@ -23,7 +23,19 @@ class AuditParser:
         self._build_index()
 
     # ------------------------------------------------------------------
-    # Construção do índice
+    # Interface pública chamada pelo orquestrador
+    # ------------------------------------------------------------------
+
+    def build_index(self) -> dict:
+        """
+        Alias público → retorna o índice já construído no __init__.
+        Chamado pelo scanntech_qa_validator.py como:
+            movements = audit_parser.build_index()
+        """
+        return self._index
+
+    # ------------------------------------------------------------------
+    # Construção do índice (privado — executado no __init__)
     # ------------------------------------------------------------------
 
     def _build_index(self) -> None:
@@ -60,11 +72,11 @@ class AuditParser:
         """Extrai campos mínimos via regex quando o JSON está malformado."""
         result: dict = {}
         patterns = {
-            "numero":        r'"numero"\s*:\s*"([^"]+)"',
-            "total":         r'"total"\s*:\s*([\d.]+)',
-            "descuentoTotal":r'"descuentoTotal"\s*:\s*([\d.]+)',
-            "cancelacion":   r'"cancelacion"\s*:\s*(true|false)',
-            "status":        r'"status"\s*:\s*(\d+)',
+            "numero":         r'"numero"\s*:\s*"([^"]+)"',
+            "total":          r'"total"\s*:\s*([\d.]+)',
+            "descuentoTotal": r'"descuentoTotal"\s*:\s*([\d.]+)',
+            "cancelacion":    r'"cancelacion"\s*:\s*(true|false)',
+            "status":         r'"status"\s*:\s*(\d+)',
         }
         for key, pat in patterns.items():
             m = re.search(pat, text)
@@ -93,9 +105,7 @@ class AuditParser:
         return self._index.get(str(numero).strip(), [])
 
     def get_by_eans(self, eans: list[str]) -> list[dict]:
-        """
-        Fallback: busca movimentos cujos detalles contenham ao menos um EAN da lista.
-        """
+        """Fallback: busca movimentos cujos detalles contenham ao menos um EAN."""
         results = []
         for movements in self._index.values():
             for mov in movements:

@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+
+# Saídas do validador
+TEMPLATE_PREENCHIDO*.xlsx
+qa_validation.log
+qa_audit_log.json
+
+# Artefatos de entrada (não versionar dados sensíveis)
+export_tickets_audit*.xlsx
+ilovepdf_merged*.pdf
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/

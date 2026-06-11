@@ -3,6 +3,7 @@ Módulo 1 — FileLoader
 Responsabilidade: Valida existência e carrega todos os artefatos.
 """
 
+import json
 import logging
 from pathlib import Path
 from typing import Optional
@@ -25,16 +26,42 @@ class FileLoader:
         json_dir: Optional[str] = None,
     ):
         self.roteiro_path = Path(roteiro_path)
-        self.audit_path = Path(audit_path)
-        self.pdf_path = Path(pdf_path)
-        self.json_dir = Path(json_dir) if json_dir else None
+        self.audit_path   = Path(audit_path)
+        self.pdf_path     = Path(pdf_path)
+        self.json_dir     = Path(json_dir) if json_dir else None
+
+    # ------------------------------------------------------------------
+    # Interfaces públicas chamadas pelo orquestrador
+    # ------------------------------------------------------------------
+
+    def validate(self) -> None:
+        """Alias público → validate_paths(). Chamado pelo orquestrador."""
+        self.validate_paths()
+
+    def load(self) -> tuple:
+        """
+        Alias público → load_all().
+        Retorna (workbook, audit_df, pdf_pages, extra_jsons) conforme
+        assinatura esperada pelo scanntech_qa_validator.py.
+        """
+        data = self.load_all()
+        return (
+            data["workbook"],
+            data["audit_df"],
+            data["pdf_pages"],
+            data["json_files"],
+        )
+
+    # ------------------------------------------------------------------
+    # Validação de existência
+    # ------------------------------------------------------------------
 
     def validate_paths(self) -> None:
         """Lança FileNotFoundError se qualquer artefato obrigatório não existir."""
         required = [
             (self.roteiro_path, "Roteiro (TEMPLATE xlsx)"),
-            (self.audit_path, "Export Audit xlsx"),
-            (self.pdf_path, "PDF de cupons"),
+            (self.audit_path,   "Export Audit xlsx"),
+            (self.pdf_path,     "PDF de cupons"),
         ]
         for path, label in required:
             if not path.exists():
@@ -43,6 +70,10 @@ class FileLoader:
 
         if self.json_dir and not self.json_dir.exists():
             raise FileNotFoundError(f"Diretório JSON não encontrado: {self.json_dir}")
+
+    # ------------------------------------------------------------------
+    # Carregamento
+    # ------------------------------------------------------------------
 
     def load_roteiro(self) -> openpyxl.Workbook:
         """Carrega o TEMPLATE xlsx em modo data_only=True."""
@@ -72,20 +103,27 @@ class FileLoader:
         logger.info("PDF carregado: %d páginas", len(pages))
         return pages
 
-    def list_json_files(self) -> list[Path]:
-        """Lista arquivos JSON no diretório opcional."""
+    def list_json_files(self) -> list:
+        """Lista e carrega JSONs do diretório opcional."""
         if not self.json_dir:
             return []
         files = sorted(self.json_dir.glob("*.json"))
-        logger.info("JSON dir: %d arquivos encontrados", len(files))
-        return files
+        loaded = []
+        for f in files:
+            try:
+                with open(f, encoding="utf-8") as fh:
+                    loaded.append(json.load(fh))
+            except Exception as e:
+                logger.warning("JSON ignorado (%s): %s", f.name, e)
+        logger.info("JSON dir: %d arquivos carregados", len(loaded))
+        return loaded
 
     def load_all(self) -> dict:
         """Valida e carrega todos os artefatos de uma vez."""
         self.validate_paths()
         return {
-            "workbook": self.load_roteiro(),
-            "audit_df": self.load_audit(),
-            "pdf_pages": self.load_pdf_text_blocks(),
+            "workbook":   self.load_roteiro(),
+            "audit_df":   self.load_audit(),
+            "pdf_pages":  self.load_pdf_text_blocks(),
             "json_files": self.list_json_files(),
         }
