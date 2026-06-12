@@ -1,62 +1,66 @@
 """
-M0 — Modelos de dados compartilhados entre módulos (modelos).
+Modelos de dados compartilhados entre módulos.
 
-Não possui dependências internas — apenas dataclasses/TypedDict puros.
+Sem dependências internas — apenas dataclasses puras.
 """
-
 from __future__ import annotations
+
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 
 @dataclass
-class CouponBlock:
-    """Representa um cupom fiscal extraído do PDF."""
-    raw_text: str
-    sat_number: Optional[str]    = None
-    ecf_number: Optional[str]    = None
-    nfce_number: Optional[str]   = None
-    coo_number: Optional[str]    = None
-    eans: List[str]              = field(default_factory=list)
-    subtotal: Optional[float]    = None
-    desconto: Optional[float]    = None
-    total: Optional[float]       = None
-    pagamentos: List[Dict]       = field(default_factory=list)
+class BlocoCupom:
+    """Cupom fiscal extraído do PDF."""
+
+    texto_bruto: str
+    numero_sat: Optional[str] = None
+    numero_ecf: Optional[str] = None
+    numero_nfce: Optional[str] = None
+    numero_coo: Optional[str] = None
+    eans: List[str] = field(default_factory=list)
+    subtotal: Optional[float] = None
+    desconto: Optional[float] = None
+    total: Optional[float] = None
+    pagamentos: List[Dict] = field(default_factory=list)
 
 
 @dataclass
-class AuditMovement:
-    """Representa um movimento do Audit (uma linha da aba AUDIT_TICKETS)."""
-    cupom_number: str
-    raw_json: Dict[str, Any]     = field(default_factory=dict)
-    status_code: Optional[int]   = None
-    total: Optional[float]       = None
-    descuento_total: Optional[float] = None
-    cancelacion: Optional[bool]  = None
-    detalles: List[Dict]         = field(default_factory=list)
-    pagos: List[Dict]            = field(default_factory=list)
-    bin_value: Optional[str]     = None
+class MovimentoAudit:
+    """Linha da aba AUDIT_TICKETS do export."""
+
+    numero_cupom: str
+    json_bruto: Dict[str, Any] = field(default_factory=dict)
+    codigo_status: Optional[int] = None
+    total: Optional[float] = None
+    desconto_total: Optional[float] = None
+    cancelado: Optional[bool] = None
+    detalhes: List[Dict] = field(default_factory=list)
+    pagamentos: List[Dict] = field(default_factory=list)
+    bin_cartao: Optional[str] = None
 
 
 @dataclass
-class CheckResult:
-    """Resultado de um check individual."""
-    check: str
-    ok: bool
+class ResultadoCheck:
+    """Resultado de uma verificação individual."""
+
+    nome_check: str
+    aprovado: bool
     detalhe: str = ""
 
 
 @dataclass
-class TestResult:
+class ResultadoTeste:
     """Resultado completo de uma linha do roteiro."""
+
     etapa: str
     linha: int
-    cupom_key: str                               = ""
-    coupons_used: List[str]                      = field(default_factory=list)
-    checks: List[CheckResult]                    = field(default_factory=list)
-    overall_ok: bool                             = True
-    error_reason: str                            = ""
-    col_sat_status: str                          = ""
-    col_ecf_status: str                          = ""
-    col_nfce_status: str                         = ""
-    col_justificativa: str                       = ""
+    chave_cupom: str = ""
+    cupons_utilizados: List[str] = field(default_factory=list)
+    checks: List[ResultadoCheck] = field(default_factory=list)
+    aprovado: bool = True
+    motivo_reprovacao: str = ""
+    status_sat: str = ""
+    status_ecf: str = ""
+    status_nfce: str = ""
+    justificativa: str = ""

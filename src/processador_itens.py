@@ -1,70 +1,74 @@
-"""Processador dos itens da venda (processador_itens).
+"""
+Processamento dos itens da venda.
 
-Transforma o campo itens_raw em lista estruturada.
+Transforma o campo itens_raw em lista estruturada de dicts.
 
 Formatos suportados:
-  - '3 x 7891000010860'          → qtd=3, ean
-  - '7891000010860'              → qtd=1, ean
-  - '3.579 x PESABLE'            → qtd=3.579, pesavel
-  - 'item1 + item2 + item3'      → vários itens
-  - '3 x 789... + 1 x 789...'   → lista mista
+  '3 x 7891000010860'        → quantidade=3, tipo=ean
+  '7891000010860'            → quantidade=1, tipo=ean
+  '3.579 x PESABLE'          → quantidade=3.579, tipo=pesavel
+  'item1 + item2 + item3'    → múltiplos itens
 """
 from __future__ import annotations
 
 import re
 from typing import Any, Dict, List
 
-# Padrão: <quantidade> x <codigo>  (quantidade pode ter ponto ou vírgula decimal)
-ITEM_PATTERN = re.compile(
-    r"^\s*(?P<qtd>[0-9]+(?:[.,][0-9]+)?)\s*x\s*(?P<codigo>.+)$",
+# Padrão: <quantidade> x <codigo>  —  quantidade aceita ponto ou vírgula decimal.
+PADRAO_ITEM = re.compile(
+    r"^\s*(?P<quantidade>[0-9]+(?:[.,][0-9]+)?)\s*x\s*(?P<codigo>.+)$",
     re.IGNORECASE,
 )
 
+SEPARADOR_ITENS = "+"
+QUANTIDADE_PADRAO = 1.0
+VALORES_NULOS = ("nan", "none", "")
 
-def _detect_tipo(codigo: str) -> str:
-    codigo_strip = codigo.strip()
-    if "pesable" in codigo_strip.lower():
+
+def _detectar_tipo(codigo: str) -> str:
+    codigo_limpo = codigo.strip()
+    if "pesable" in codigo_limpo.lower():
         return "pesavel"
-    if re.fullmatch(r"[0-9]+", codigo_strip):
+    if re.fullmatch(r"[0-9]+", codigo_limpo):
         return "ean"
     return "texto"
 
 
-def _parse_qtd(qtd_str: str) -> float:
-    return float(qtd_str.replace(",", "."))
+def _converter_quantidade(quantidade_str: str) -> float:
+    return float(quantidade_str.replace(",", "."))
 
 
-def parse_itens(itens_raw: Any) -> List[Dict[str, Any]]:
-    """Converte itens_raw em lista de dicts estruturados.
+def _parse_parte(parte: str) -> Dict[str, Any]:
+    """Converte uma parte individual do campo itens_raw em dict estruturado."""
+    correspondencia = PADRAO_ITEM.match(parte)
+    if correspondencia:
+        quantidade = _converter_quantidade(correspondencia.group("quantidade"))
+        codigo = correspondencia.group("codigo").strip()
+    else:
+        quantidade = QUANTIDADE_PADRAO
+        codigo = parte.strip()
 
-    Retorna lista vazia se o campo for nulo ou não reconhecido.
-    """
-    if itens_raw is None:
+    return {
+        "codigo": codigo,
+        "quantidade": quantidade,
+        "tipo": _detectar_tipo(codigo),
+        "valor_original": parte,
+    }
+
+
+def processar_itens(itens_bruto: Any) -> List[Dict[str, Any]]:
+    """Converte itens_bruto em lista de dicts estruturados."""
+    if itens_bruto is None:
         return []
-    raw_str = str(itens_raw).strip()
-    if not raw_str or raw_str.lower() in ("nan", "none", ""):
+
+    texto = str(itens_bruto).strip()
+
+    if texto.lower() in VALORES_NULOS:
         return []
 
-    partes = [p.strip() for p in raw_str.split("+") if p.strip()]
-    itens: List[Dict[str, Any]] = []
+    partes = [parte.strip() for parte in texto.split(SEPARADOR_ITENS) if parte.strip()]
+    return [_parse_parte(parte) for parte in partes]
 
-    for parte in partes:
-        m = ITEM_PATTERN.match(parte)
-        if m:
-            qtd = _parse_qtd(m.group("qtd"))
-            codigo = m.group("codigo").strip()
-        else:
-            qtd = 1.0
-            codigo = parte.strip()
 
-        tipo = _detect_tipo(codigo)
-        itens.append(
-            {
-                "codigo": codigo,
-                "quantidade": qtd,
-                "tipo": tipo,
-                "raw_parte": parte,
-            }
-        )
-
-    return itens
+# Alias de compatibilidade — mantido enquanto test_runner.py ainda referencia parse_itens
+parse_itens = processar_itens
