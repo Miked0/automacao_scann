@@ -1,91 +1,99 @@
 """
-Módulo 1 — FileLoader (carregador_arquivos)
-Responsabilidade: Valida existência e carrega todos os artefatos.
-"""
+Carregamento e validação dos artefatos de entrada.
 
+Responsabilidade única: garantir que todos os arquivos existem
+e entregá-los já carregados para os módulos seguintes.
+"""
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 
-import pandas as pd
 import openpyxl
+import pandas as pd
 import pdfplumber
 
 logger = logging.getLogger(__name__)
 
+NOME_ABA_AUDIT      = "AUDIT_TICKETS"
+INDICE_PRIMEIRA_ABA = 0
 
-class FileLoader:
+
+class CarregadorArquivos:
     """Valida e carrega os artefatos de entrada do validador QA."""
 
     def __init__(
         self,
-        roteiro_path: str,
-        audit_path: str,
-        pdf_path: str,
-        json_dir: Optional[str] = None,
+        caminho_roteiro: str,
+        caminho_audit: str,
+        caminho_pdf: str,
+        diretorio_json: Optional[str] = None,
     ):
-        self.roteiro_path = Path(roteiro_path)
-        self.audit_path = Path(audit_path)
-        self.pdf_path = Path(pdf_path)
-        self.json_dir = Path(json_dir) if json_dir else None
+        self.caminho_roteiro = Path(caminho_roteiro)
+        self.caminho_audit   = Path(caminho_audit)
+        self.caminho_pdf     = Path(caminho_pdf)
+        self.diretorio_json  = Path(diretorio_json) if diretorio_json else None
 
-    def validate_paths(self) -> None:
-        """Lança FileNotFoundError se qualquer artefato obrigatório não existir."""
-        required = [
-            (self.roteiro_path, "Roteiro (TEMPLATE xlsx)"),
-            (self.audit_path, "Export Audit xlsx"),
-            (self.pdf_path, "PDF de cupons"),
+    def validar_caminhos(self) -> None:
+        """Lança FileNotFoundError se qualquer artefato obrigatório estiver ausente."""
+        artefatos_obrigatorios = [
+            (self.caminho_roteiro, "Roteiro (TEMPLATE xlsx)"),
+            (self.caminho_audit,   "Export Audit xlsx"),
+            (self.caminho_pdf,     "PDF de cupons"),
         ]
-        for path, label in required:
-            if not path.exists():
-                raise FileNotFoundError(f"{label} não encontrado: {path}")
-            logger.info("Artefato validado: %s → %s", label, path)
+        for caminho, descricao in artefatos_obrigatorios:
+            if not caminho.exists():
+                raise FileNotFoundError(f"{descricao} não encontrado: {caminho}")
+            logger.info("Artefato validado: %s → %s", descricao, caminho)
 
-        if self.json_dir and not self.json_dir.exists():
-            raise FileNotFoundError(f"Diretório JSON não encontrado: {self.json_dir}")
+        if self.diretorio_json and not self.diretorio_json.exists():
+            raise FileNotFoundError(
+                f"Diretório JSON não encontrado: {self.diretorio_json}"
+            )
 
-    def load_roteiro(self) -> openpyxl.Workbook:
-        """Carrega o TEMPLATE xlsx em modo data_only=True."""
-        logger.info("Carregando roteiro: %s", self.roteiro_path)
-        return openpyxl.load_workbook(self.roteiro_path, data_only=True)
+    def carregar_roteiro(self) -> openpyxl.Workbook:
+        logger.info("Carregando roteiro: %s", self.caminho_roteiro)
+        return openpyxl.load_workbook(self.caminho_roteiro, data_only=True)
 
-    def load_audit(self) -> pd.DataFrame:
-        """Carrega o export Audit como DataFrame (aba AUDIT_TICKETS)."""
-        logger.info("Carregando audit: %s", self.audit_path)
+    def carregar_audit(self) -> pd.DataFrame:
+        logger.info("Carregando audit: %s", self.caminho_audit)
         try:
-            df = pd.read_excel(self.audit_path, sheet_name="AUDIT_TICKETS")
+            dataframe = pd.read_excel(self.caminho_audit, sheet_name=NOME_ABA_AUDIT)
         except Exception:
-            logger.warning("Aba AUDIT_TICKETS não encontrada — lendo primeira aba.")
-            df = pd.read_excel(self.audit_path, sheet_name=0)
-        logger.info("Audit carregado: %d linhas", len(df))
-        return df
+            # Aba padrão ausente — lemos a primeira disponível como fallback
+            logger.warning("Aba '%s' não encontrada — lendo primeira aba.", NOME_ABA_AUDIT)
+            dataframe = pd.read_excel(self.caminho_audit, sheet_name=INDICE_PRIMEIRA_ABA)
+        logger.info("Audit carregado: %d linhas", len(dataframe))
+        return dataframe
 
-    def load_pdf_text_blocks(self) -> list:
-        """Extrai texto bruto do PDF e retorna lista de páginas."""
-        logger.info("Carregando PDF: %s", self.pdf_path)
-        pages = []
-        with pdfplumber.open(self.pdf_path) as pdf:
-            for i, page in enumerate(pdf.pages):
-                text = page.extract_text() or ""
-                pages.append(text)
-                logger.debug("Página %d: %d chars", i + 1, len(text))
-        logger.info("PDF carregado: %d páginas", len(pages))
-        return pages
+    def carregar_paginas_pdf(self) -> List[str]:
+        """Extrai texto bruto do PDF página a página."""
+        logger.info("Carregando PDF: %s", self.caminho_pdf)
+        paginas: List[str] = []
+        with pdfplumber.open(self.caminho_pdf) as pdf:
+            for numero, pagina in enumerate(pdf.pages, start=1):
+                texto = pagina.extract_text() or ""
+                paginas.append(texto)
+                logger.debug("Página %d: %d caracteres", numero, len(texto))
+        logger.info("PDF carregado: %d página(s)", len(paginas))
+        return paginas
 
-    def list_json_files(self) -> list:
-        """Lista arquivos JSON no diretório opcional."""
-        if not self.json_dir:
+    def listar_arquivos_json(self) -> List[Path]:
+        if not self.diretorio_json:
             return []
-        files = sorted(self.json_dir.glob("*.json"))
-        logger.info("JSON dir: %d arquivos encontrados", len(files))
-        return files
+        arquivos = sorted(self.diretorio_json.glob("*.json"))
+        logger.info("Diretório JSON: %d arquivo(s) encontrado(s)", len(arquivos))
+        return arquivos
 
-    def load_all(self) -> dict:
+    def carregar_tudo(self) -> Dict:
         """Valida e carrega todos os artefatos de uma vez."""
-        self.validate_paths()
+        self.validar_caminhos()
         return {
-            "workbook":   self.load_roteiro(),
-            "audit_df":   self.load_audit(),
-            "pdf_pages":  self.load_pdf_text_blocks(),
-            "json_files": self.list_json_files(),
+            "workbook":      self.carregar_roteiro(),
+            "audit_df":      self.carregar_audit(),
+            "pdf_paginas":   self.carregar_paginas_pdf(),
+            "json_arquivos": self.listar_arquivos_json(),
         }
+
+
+# Alias de compatibilidade — mantido enquanto __init__.py referencia FileLoader
+FileLoader = CarregadorArquivos

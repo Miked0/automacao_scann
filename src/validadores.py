@@ -1,128 +1,202 @@
-"""Validações do MVP (validadores).
+"""
+Validações do MVP.
 
 Status possíveis por caso de teste:
-  OK             - tudo validado dentro da tolerância
-  ALERTA         - diferença dentro da tolerância (≤ 0,01)
-  REVISAR        - caso especial que exige análise humana
-  ERRO_PARSE     - falha ao parsear itens
-  ERRO_VALOR     - subtotal/desconto/total com problema aritmético ou não-numérico
-  ERRO_PAGAMENTO - forma de pagamento não mapeada
+  OK             — tudo validado dentro da tolerância
+  ALERTA         — diferença ≤ 0,01 (dentro da tolerância aceitável)
+  REVISAR        — caso especial que exige análise humana
+  ERRO_PARSE     — falha ao processar itens
+  ERRO_VALOR     — subtotal/desconto/total aritmeticamente inconsistente
+  ERRO_PAGAMENTO — forma de pagamento não mapeada
 """
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from processador_itens import parse_itens
-from pagamentos import normalize_pagamento
+from processador_itens import processar_itens
+from pagamentos import normalizar_pagamento
 
-TOLERANCIA = Decimal("0.01")
-DECIMAL_PLACES = Decimal("0.01")
+# --- Constantes -----------------------------------------------------------
 
-SPECIAL_KEYWORDS = [
-    "acrescimo",
-    "acréscimo",
-    "nao aplicada",
-    "não aplicada",
-    "promoção nao",
-    "promo nao",
-    "cancelamento",
-    "limite",
-    "bin",
+STATUS_OK             = "OK"
+STATUS_ALERTA         = "ALERTA"
+STATUS_REVISAR        = "REVISAR"
+STATUS_ERRO_PARSE     = "ERRO_PARSE"
+STATUS_ERRO_VALOR     = "ERRO_VALOR"
+STATUS_ERRO_PAGAMENTO = "ERRO_PAGAMENTO"
+
+TOLERANCIA    = Decimal("0.01")
+DECIMAL_CASAS = Decimal("0.01")
+
+DESCONTO_NULO = {None, "", "nan", "None", "0", "0.0", "0,0"}
+
+PALAVRAS_CASO_ESPECIAL = [
+    "acrescimo", "acréscimo",
+    "nao aplicada", "não aplicada",
+    "promoção nao", "promo nao",
+    "cancelamento", "limite", "bin",
 ]
 
+VALORES_NULOS = ("", "nan", "None")
 
-def _to_decimal(value: Any) -> Dict[str, Any]:
-    """Converte valor para Decimal com tratamento de ruído floating point."""
-    if value is None or str(value).strip() in ("", "nan", "None"):
-        return {"raw": None, "norm": None, "error": True}
+# --------------------------------------------------------------------------
+
+
+def _converter_para_decimal(valor: Any) -> Dict[str, Any]:
+    """
+    Converte valor bruto em Decimal.
+
+    Usamos Decimal para evitar ruído de ponto flutuante em comparações monetárias.
+    """
+    if valor is None or str(valor).strip() in VALORES_NULOS:
+        return {"valor": None, "normalizado": None, "erro": True}
     try:
-        raw = Decimal(str(value).replace(",", ".").strip())
-        norm = raw.quantize(DECIMAL_PLACES)
-        return {"raw": raw, "norm": norm, "error": False}
+        valor_decimal = Decimal(str(valor).replace(",", ".").strip())
+        return {
+            "valor": valor_decimal,
+            "normalizado": valor_decimal.quantize(DECIMAL_CASAS),
+            "erro": False,
+        }
     except (InvalidOperation, ValueError):
-        return {"raw": None, "norm": None, "error": True}
+        return {"valor": None, "normalizado": None, "erro": True}
 
 
-def _check_special_case(obs: Optional[str]) -> bool:
-    """Verifica se a observação indica caso especial que precisa de revisão manual."""
-    if not obs:
+def _eh_caso_especial(observacao: Optional[str]) -> bool:
+    """Detecta se a observação indica cenário que exige revisão manual."""
+    if not observacao:
         return False
-    obs_norm = obs.strip().lower()
-    return any(kw in obs_norm for kw in SPECIAL_KEYWORDS)
+    observacao_normalizada = observacao.strip().lower()
+    return any(palavra in observacao_normalizada for palavra in PALAVRAS_CASO_ESPECIAL)
 
 
-def validate_test_case(test: Dict[str, Any]) -> Dict[str, Any]:
-    """Valida um caso de teste e retorna dict com status e campos normalizados."""
-    status = "OK"
-    motivo: List[str] = []
-    alertas: List[str] = []
+def _validar_identificador(
+    caso: Dict[str, Any],
+    status: str,
+    motivos: List[str],
+) -> str:
+    identificador = str(caso.get("teste", "") or "").strip()
+    if not identificador:
+        motivos.append("Teste sem identificador")
+        return STATUS_ERRO_VALOR
+    return status
 
-    if not str(test.get("teste", "") or "").strip():
-        status = "ERRO_VALOR"
-        motivo.append("Teste sem identificador")
 
-    itens = parse_itens(test.get("itens_raw"))
-    itens_raw = test.get("itens_raw")
-    if itens_raw and not itens:
-        status = "ERRO_PARSE"
-        motivo.append("Falha ao parsear itens")
-    elif not itens_raw:
+def _validar_itens(
+    caso: Dict[str, Any],
+    status: str,
+    motivos: List[str],
+    alertas: List[str],
+) -> Tuple[str, Any]:
+    itens_bruto = caso.get("itens_raw")
+    itens = processar_itens(itens_bruto)
+    if itens_bruto and not itens:
+        motivos.append("Falha ao processar itens")
+        return STATUS_ERRO_PARSE, itens
+    if not itens_bruto:
         alertas.append("Campo itens_raw vazio")
+    return status, itens
 
-    pag = normalize_pagamento(test.get("pagamento_raw"))
-    if pag["codigo_tipo_pago"] is None and not pag["is_multiplo"]:
-        if pag["pagamento_normalizado"] is not None:
-            if status == "OK":
-                status = "ERRO_PAGAMENTO"
-            motivo.append(f"Pagamento não mapeado: {pag['pagamento_normalizado']}")
+
+def _validar_pagamento(
+    caso: Dict[str, Any],
+    status: str,
+    motivos: List[str],
+    alertas: List[str],
+) -> Tuple[str, Dict]:
+    pagamento = normalizar_pagamento(caso.get("pagamento_raw"))
+    codigo_ausente = pagamento["codigo_tipo_pago"] is None
+    nao_multiplo   = not pagamento["is_multiplo"]
+
+    if codigo_ausente and nao_multiplo:
+        if pagamento["pagamento_normalizado"] is not None:
+            motivos.append(f"Pagamento não mapeado: {pagamento['pagamento_normalizado']}")
+            if status == STATUS_OK:
+                status = STATUS_ERRO_PAGAMENTO
         else:
             alertas.append("Pagamento ausente")
 
-    sub = _to_decimal(test.get("subtotal_raw"))
-    dsc = _to_decimal(test.get("desconto_raw"))
-    tot = _to_decimal(test.get("total_raw"))
+    return status, pagamento
 
-    if sub["error"]:
-        status = "ERRO_VALOR"
-        motivo.append("Subtotal não numérico")
-    if dsc["error"]:
-        if test.get("desconto_raw") not in (None, "", "nan", "None", "0", "0.0", "0,0"):
-            status = "ERRO_VALOR"
-            motivo.append("Desconto não numérico")
-        else:
-            dsc = {"raw": Decimal("0"), "norm": Decimal("0.00"), "error": False}
-    if tot["error"]:
-        status = "ERRO_VALOR"
-        motivo.append("Total não numérico")
 
-    if not any([sub["error"], dsc["error"], tot["error"]]):
-        esperado = sub["norm"] - dsc["norm"]
-        diff = (esperado - tot["norm"]).copy_abs()
-        if diff > TOLERANCIA:
-            if status == "OK":
-                status = "ERRO_VALOR"
-            motivo.append(
-                f"Total não fecha: esperado={esperado}, informado={tot['norm']}, diferença={diff}"
+def _validar_desconto(desconto_bruto: Any) -> Dict[str, Any]:
+    """Desconto vazio ou zero é válido — assumimos R$ 0,00."""
+    resultado = _converter_para_decimal(desconto_bruto)
+    if resultado["erro"] and desconto_bruto in DESCONTO_NULO:
+        return {"valor": Decimal("0"), "normalizado": Decimal("0.00"), "erro": False}
+    return resultado
+
+
+def _validar_valores_monetarios(
+    caso: Dict[str, Any],
+    status: str,
+    motivos: List[str],
+    alertas: List[str],
+) -> Tuple[str, Dict, Dict, Dict]:
+    subtotal = _converter_para_decimal(caso.get("subtotal_raw"))
+    desconto = _validar_desconto(caso.get("desconto_raw"))
+    total    = _converter_para_decimal(caso.get("total_raw"))
+
+    if subtotal["erro"]:
+        motivos.append("Subtotal não numérico")
+        status = STATUS_ERRO_VALOR
+    if desconto["erro"]:
+        motivos.append("Desconto não numérico")
+        status = STATUS_ERRO_VALOR
+    if total["erro"]:
+        motivos.append("Total não numérico")
+        status = STATUS_ERRO_VALOR
+
+    algum_erro = subtotal["erro"] or desconto["erro"] or total["erro"]
+    if not algum_erro:
+        total_esperado = subtotal["normalizado"] - desconto["normalizado"]
+        diferenca = (total_esperado - total["normalizado"]).copy_abs()
+
+        if diferenca > TOLERANCIA:
+            motivos.append(
+                f"Total não fecha: esperado={total_esperado}, "
+                f"informado={total['normalizado']}, diferença={diferenca}"
             )
-        elif diff > Decimal("0"):
-            if status == "OK":
-                status = "ALERTA"
-            alertas.append(f"Diferença de R$ {diff} dentro da tolerância de 0,01")
+            if status == STATUS_OK:
+                status = STATUS_ERRO_VALOR
+        elif diferenca > Decimal("0"):
+            alertas.append(f"Diferença de R$ {diferenca} dentro da tolerância de 0,01")
+            if status == STATUS_OK:
+                status = STATUS_ALERTA
 
-    if _check_special_case(test.get("observacoes_raw")):
-        if status == "OK":
-            status = "REVISAR"
-        alertas.append("Caso especial detectado na observação - requer análise humana")
+    return status, subtotal, desconto, total
+
+
+def validar_caso_de_teste(caso: Dict[str, Any]) -> Dict[str, Any]:
+    """Valida um caso de teste e devolve dict com status e campos normalizados."""
+    status:  str       = STATUS_OK
+    motivos: List[str] = []
+    alertas: List[str] = []
+
+    status                = _validar_identificador(caso, status, motivos)
+    status, itens         = _validar_itens(caso, status, motivos, alertas)
+    status, pagamento     = _validar_pagamento(caso, status, motivos, alertas)
+    status, subtotal, desconto, total = _validar_valores_monetarios(
+        caso, status, motivos, alertas
+    )
+
+    if _eh_caso_especial(caso.get("observacoes_raw")):
+        alertas.append("Caso especial detectado na observação — requer análise humana")
+        if status == STATUS_OK:
+            status = STATUS_REVISAR
 
     return {
-        "status_final": status,
-        "motivo_status": "; ".join(motivo) if motivo else None,
-        "alertas": "; ".join(alertas) if alertas else None,
-        "itens_parseados": str(itens) if itens else None,
-        "codigo_tipo_pago": pag["codigo_tipo_pago"],
-        "pagamento_normalizado": pag["pagamento_normalizado"],
-        "is_multiplo": pag["is_multiplo"],
-        "requires_bin": pag["requires_bin"],
-        "subtotal_norm": str(sub["norm"]) if not sub["error"] else None,
-        "desconto_norm": str(dsc["norm"]) if not dsc["error"] else None,
-        "total_norm": str(tot["norm"]) if not tot["error"] else None,
+        "status_final":          status,
+        "motivo_status":         "; ".join(motivos) if motivos else None,
+        "alertas":               "; ".join(alertas) if alertas else None,
+        "itens_parseados":       str(itens) if itens else None,
+        "codigo_tipo_pago":      pagamento["codigo_tipo_pago"],
+        "pagamento_normalizado": pagamento["pagamento_normalizado"],
+        "is_multiplo":           pagamento["is_multiplo"],
+        "requires_bin":          pagamento["requires_bin"],
+        "subtotal_norm":         str(subtotal["normalizado"]) if not subtotal["erro"] else None,
+        "desconto_norm":         str(desconto["normalizado"]) if not desconto["erro"] else None,
+        "total_norm":            str(total["normalizado"])    if not total["erro"]    else None,
     }
+
+
+# Alias de compatibilidade — mantido enquanto main.py ainda referencia validate_test_case
+validate_test_case = validar_caso_de_teste
