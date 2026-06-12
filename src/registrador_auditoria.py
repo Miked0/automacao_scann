@@ -1,63 +1,73 @@
 """
-Módulo 7 — AuditLogger (registrador_auditoria)
-Responsabilidade: Gera log JSON estruturado de cada check.
+Registrador de auditoria — gera log JSON estruturado de cada check.
 """
-
 import json
 import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from .test_runner import TestResult
+from .modelos import ResultadoTeste
 
 logger = logging.getLogger(__name__)
 
 
-class AuditLogger:
+class RegistradorAuditoria:
     """Registra cada execução de teste em log JSON estruturado."""
 
-    def __init__(self, log_path: str):
-        self.log_path = Path(log_path)
-        self._entries: list = []
+    def __init__(self, caminho_log: str):
+        self.caminho_log = Path(caminho_log)
+        self._entradas: list = []
 
-    def record(self, result: TestResult, cupons_utilizados: Optional[list] = None) -> None:
-        """Adiciona entrada de um teste ao log em memória."""
-        entry = {
+    def registrar(self, resultado: ResultadoTeste, cupons_utilizados: Optional[list] = None) -> None:
+        entrada = {
             "timestamp":         datetime.now().isoformat(),
-            "etapa":             result.etapa,
-            "linha":             result.linha,
-            "cupom_numero":      result.cupom_numero,
+            "etapa":             resultado.etapa,
+            "linha":             resultado.linha,
+            "chave_cupom":       resultado.chave_cupom,
             "cupons_utilizados": cupons_utilizados or [],
-            "passou":            result.passed,
-            "motivo_erro":       result.motivo_erro,
+            "aprovado":          resultado.aprovado,
+            "motivo_reprovacao": resultado.motivo_reprovacao,
             "checks": [
                 {
-                    "check":   c.check,
-                    "ok":      c.ok,
-                    "detalhe": c.detalhe,
+                    "nome_check": c.nome_check,
+                    "aprovado":   c.aprovado,
+                    "detalhe":    c.detalhe,
                 }
-                for c in result.checks
+                for c in resultado.checks
             ],
         }
-        self._entries.append(entry)
+        self._entradas.append(entrada)
 
-    def flush(self) -> None:
+    def persistir(self) -> None:
         """Persiste todos os registros no arquivo JSON."""
-        with open(self.log_path, "w", encoding="utf-8") as f:
-            json.dump(self._entries, f, ensure_ascii=False, indent=2)
+        with open(self.caminho_log, "w", encoding="utf-8") as f:
+            json.dump(self._entradas, f, ensure_ascii=False, indent=2)
         logger.info(
-            "AuditLogger: %d entradas salvas em %s",
-            len(self._entries), self.log_path
+            "RegistradorAuditoria: %d entradas salvas em %s",
+            len(self._entradas), self.caminho_log,
         )
 
-    def summary(self) -> dict:
-        """Retorna um resumo estatístico da execução."""
-        total  = len(self._entries)
-        passou = sum(1 for e in self._entries if e["passou"])
+    def resumo(self) -> dict:
+        total  = len(self._entradas)
+        passou = sum(1 for e in self._entradas if e["aprovado"])
         return {
             "total":  total,
             "passou": passou,
             "falhou": total - passou,
             "pct_ok": round((passou / total * 100) if total else 0, 1),
         }
+
+    # Aliases de compatibilidade
+    def record(self, resultado, cupons_utilizados=None):
+        return self.registrar(resultado, cupons_utilizados)
+
+    def flush(self):
+        return self.persistir()
+
+    def summary(self):
+        return self.resumo()
+
+
+# Alias de compatibilidade
+AuditLogger = RegistradorAuditoria

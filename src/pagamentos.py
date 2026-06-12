@@ -1,13 +1,12 @@
 """
 Normalização de formas de pagamento.
 
-Mapeia texto livre da planilha para codigoTipoPago da API Scanntech.
+Mapeia texto livre da planilha para código do tipo de pagamento.
 Cenários com múltiplos meios são sinalizados mas não resolvidos no MVP.
 """
 from typing import Any, Dict, Optional
 
-# Mapeamento texto normalizado → codigoTipoPago
-# Ordem importa: termos mais específicos antes dos genéricos.
+# Mapeamento texto normalizado → codigo_tipo_pago
 MAPEAMENTO_PAGAMENTO: Dict[str, int] = {
     "cartao credito":    10,
     "cartão credito":    10,
@@ -35,7 +34,7 @@ MAPEAMENTO_PAGAMENTO: Dict[str, int] = {
 INDICADORES_MULTIPLOS = ["+", " e ", " y ", "veces", "tercero",
                          "duas", "dois", "tres", "tres vezes"]
 
-TERMOS_CREDITO = ("credito", "crédito", "cartao", "cartão")
+TERMOS_CARTAO = ("credito", "crédito", "cartao", "cartão")
 
 VALORES_NULOS = ("", "nan", "none")
 
@@ -43,7 +42,7 @@ VALORES_NULOS = ("", "nan", "none")
 def _remover_acentos(texto: str) -> str:
     import unicodedata
     normalizado = unicodedata.normalize("NFKD", texto)
-    return "".join(char for char in normalizado if not unicodedata.combining(char))
+    return "".join(c for c in normalizado if not unicodedata.combining(c))
 
 
 def _normalizar_texto(texto: str) -> str:
@@ -55,7 +54,7 @@ def _eh_valor_nulo(texto: str) -> bool:
 
 
 def _detectar_multiplos(texto: str) -> bool:
-    return any(indicador in texto for indicador in INDICADORES_MULTIPLOS)
+    return any(ind in texto for ind in INDICADORES_MULTIPLOS)
 
 
 def _buscar_codigo_tipo(texto: str) -> Optional[int]:
@@ -66,17 +65,16 @@ def _buscar_codigo_tipo(texto: str) -> Optional[int]:
 
 
 def _requer_bin(texto: str) -> bool:
-    """Crédito e cartão exigem validação de BIN nos checks subsequentes."""
-    return any(termo in texto for termo in TERMOS_CREDITO)
+    return any(termo in texto for termo in TERMOS_CARTAO)
 
 
 def normalizar_pagamento(pagamento_bruto: Any) -> Dict[str, Any]:
     """Normaliza a forma de pagamento e devolve campos enriquecidos."""
     RESULTADO_NULO = {
         "pagamento_normalizado": None,
-        "codigo_tipo_pago": None,
-        "is_multiplo": False,
-        "requires_bin": False,
+        "codigo_tipo_pago":      None,
+        "is_multiplo":           False,
+        "requires_bin":          False,
     }
 
     if pagamento_bruto is None:
@@ -90,14 +88,14 @@ def normalizar_pagamento(pagamento_bruto: Any) -> Dict[str, Any]:
     if _detectar_multiplos(texto):
         return {
             "pagamento_normalizado": "MULTIPLO",
-            "codigo_tipo_pago": None,
-            "is_multiplo": True,
-            "requires_bin": False,
+            "codigo_tipo_pago":      None,
+            "is_multiplo":           True,
+            "requires_bin":          False,
         }
 
     return {
         "pagamento_normalizado": texto,
-        "codigo_tipo_pago": _buscar_codigo_tipo(texto),
-        "is_multiplo": False,
-        "requires_bin": _requer_bin(texto),
+        "codigo_tipo_pago":      _buscar_codigo_tipo(texto),
+        "is_multiplo":           False,
+        "requires_bin":          _requer_bin(texto),
     }

@@ -1,41 +1,26 @@
-# automacao_scann — pacote src
-# Expõe as classes principais para uso externo e compatibilidade com imports legados.
-
-from .carregador_arquivos    import CarregadorArquivos
-from .extrator_cupom_pdf     import CouponPDFParser, Coupon
-from .processador_auditoria  import ProcessadorAuditoria
-from .motor_promocoes        import MotorPromocoes
-from .executor_testes        import ExecutorTestes, ResultadoTeste, ResultadoCheck
-from .gravador_resultados    import GravadorResultados
-from .registrador_auditoria  import AuditLogger
-
-# Aliases de compatibilidade (nomes legados usados por integrações externas)
-FileLoader   = CarregadorArquivos
-ResultWriter = GravadorResultados
-AuditParser  = ProcessadorAuditoria
-PromoEngine  = MotorPromocoes
-TestRunner   = ExecutorTestes
-TestResult   = ResultadoTeste
-CheckResult  = ResultadoCheck
+"""
+Pacote de automação de validação de roteiro de testes PDV.
+"""
+from .modelos               import BlocoCupom, MovimentoAudit, ResultadoCheck, ResultadoTeste
+from .leitor                import carregar_casos_do_roteiro
+from .processador_itens     import processar_itens
+from .pagamentos            import normalizar_pagamento
+from .motor_promocoes       import MotorPromocoes, ResultadoPromo
+from .validadores           import validar_caso_de_teste
+from .exportadores          import exportar_resultados
+from .registrador_auditoria import RegistradorAuditoria
 
 __all__ = [
-    # Nomes canônicos (pt-BR)
-    "CarregadorArquivos",
-    "CouponPDFParser",
-    "Coupon",
-    "ProcessadorAuditoria",
-    "MotorPromocoes",
-    "ExecutorTestes",
-    "ResultadoTeste",
+    "BlocoCupom",
+    "MovimentoAudit",
     "ResultadoCheck",
-    "GravadorResultados",
-    "AuditLogger",
-    # Aliases legados
-    "FileLoader",
-    "ResultWriter",
-    "AuditParser",
-    "PromoEngine",
-    "TestRunner",
-    "TestResult",
-    "CheckResult",
+    "ResultadoTeste",
+    "carregar_casos_do_roteiro",
+    "processar_itens",
+    "normalizar_pagamento",
+    "MotorPromocoes",
+    "ResultadoPromo",
+    "validar_caso_de_teste",
+    "exportar_resultados",
+    "RegistradorAuditoria",
 ]

@@ -44,18 +44,18 @@ PREFIXO_ERRO   = "ERRO"
 STATUS_REVISAR = ("ALERTA", "REVISAR")
 
 
-def _reordenar_colunas(dataframe: pd.DataFrame) -> pd.DataFrame:
-    colunas_presentes = [col for col in COLUNAS_ORDEM if col in dataframe.columns]
-    colunas_extras    = [col for col in dataframe.columns if col not in COLUNAS_ORDEM]
-    return dataframe[colunas_presentes + colunas_extras]
+def _reordenar_colunas(df: pd.DataFrame) -> pd.DataFrame:
+    presentes = [c for c in COLUNAS_ORDEM if c in df.columns]
+    extras    = [c for c in df.columns if c not in COLUNAS_ORDEM]
+    return df[presentes + extras]
 
 
-def _filtrar_erros(dataframe: pd.DataFrame) -> pd.DataFrame:
-    return dataframe[dataframe["status_final"].str.startswith(PREFIXO_ERRO, na=False)]
+def _filtrar_erros(df: pd.DataFrame) -> pd.DataFrame:
+    return df[df["status_final"].str.startswith(PREFIXO_ERRO, na=False)]
 
 
-def _filtrar_alertas_e_revisao(dataframe: pd.DataFrame) -> pd.DataFrame:
-    return dataframe[dataframe["status_final"].isin(STATUS_REVISAR)]
+def _filtrar_alertas_e_revisao(df: pd.DataFrame) -> pd.DataFrame:
+    return df[df["status_final"].isin(STATUS_REVISAR)]
 
 
 def _gravar_abas(
@@ -74,21 +74,18 @@ def _gravar_abas(
 def exportar_resultados(resultados: List[Dict[str, Any]], caminho_saida: Path) -> None:
     """Grava os resultados de validação em arquivo Excel com abas separadas."""
     caminho_saida.parent.mkdir(parents=True, exist_ok=True)
-
-    dataframe = _reordenar_colunas(pd.DataFrame(resultados))
-    erros     = _filtrar_erros(dataframe)
-    alertas   = _filtrar_alertas_e_revisao(dataframe)
-
+    df      = _reordenar_colunas(pd.DataFrame(resultados))
+    erros   = _filtrar_erros(df)
+    alertas = _filtrar_alertas_e_revisao(df)
     with pd.ExcelWriter(caminho_saida, engine="openpyxl") as writer:
-        _gravar_abas(writer, dataframe, erros, alertas)
-
+        _gravar_abas(writer, df, erros, alertas)
     print(
         f"[INFO] Abas geradas: "
-        f"Resultado ({len(dataframe)}), "
+        f"Resultado ({len(df)}), "
         f"Erros ({len(erros)}), "
         f"Alertas ({len(alertas)})"
     )
 
 
-# Alias de compatibilidade — mantido enquanto main.py ainda referencia export_results
+# Alias de compatibilidade
 export_results = exportar_resultados

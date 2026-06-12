@@ -1,33 +1,32 @@
 """
 Processamento dos itens da venda.
 
-Transforma o campo itens_raw em lista estruturada de dicts.
+Transforma o campo itens_bruto em lista estruturada de dicts.
 
 Formatos suportados:
-  '3 x 7891000010860'        → quantidade=3, tipo=ean
-  '7891000010860'            → quantidade=1, tipo=ean
-  '3.579 x PESABLE'          → quantidade=3.579, tipo=pesavel
-  'item1 + item2 + item3'    → múltiplos itens
+  '3 x 7891000010860'     → quantidade=3, tipo=ean
+  '7891000010860'         → quantidade=1, tipo=ean
+  '3.579 x PESAVEL'       → quantidade=3.579, tipo=pesavel
+  'item1 + item2 + item3' → múltiplos itens
 """
 from __future__ import annotations
 
 import re
 from typing import Any, Dict, List
 
-# Padrão: <quantidade> x <codigo>  —  quantidade aceita ponto ou vírgula decimal.
 PADRAO_ITEM = re.compile(
     r"^\s*(?P<quantidade>[0-9]+(?:[.,][0-9]+)?)\s*x\s*(?P<codigo>.+)$",
     re.IGNORECASE,
 )
 
-SEPARADOR_ITENS = "+"
+SEPARADOR_ITENS   = "+"
 QUANTIDADE_PADRAO = 1.0
-VALORES_NULOS = ("nan", "none", "")
+VALORES_NULOS     = ("nan", "none", "")
 
 
 def _detectar_tipo(codigo: str) -> str:
     codigo_limpo = codigo.strip()
-    if "pesable" in codigo_limpo.lower():
+    if "pesable" in codigo_limpo.lower() or "pesavel" in codigo_limpo.lower():
         return "pesavel"
     if re.fullmatch(r"[0-9]+", codigo_limpo):
         return "ean"
@@ -39,7 +38,6 @@ def _converter_quantidade(quantidade_str: str) -> float:
 
 
 def _parse_parte(parte: str) -> Dict[str, Any]:
-    """Converte uma parte individual do campo itens_raw em dict estruturado."""
     correspondencia = PADRAO_ITEM.match(parte)
     if correspondencia:
         quantidade = _converter_quantidade(correspondencia.group("quantidade"))
@@ -60,15 +58,12 @@ def processar_itens(itens_bruto: Any) -> List[Dict[str, Any]]:
     """Converte itens_bruto em lista de dicts estruturados."""
     if itens_bruto is None:
         return []
-
     texto = str(itens_bruto).strip()
-
     if texto.lower() in VALORES_NULOS:
         return []
+    partes = [p.strip() for p in texto.split(SEPARADOR_ITENS) if p.strip()]
+    return [_parse_parte(p) for p in partes]
 
-    partes = [parte.strip() for parte in texto.split(SEPARADOR_ITENS) if parte.strip()]
-    return [_parse_parte(parte) for parte in partes]
 
-
-# Alias de compatibilidade — mantido enquanto test_runner.py ainda referencia parse_itens
+# Alias de compatibilidade
 parse_itens = processar_itens

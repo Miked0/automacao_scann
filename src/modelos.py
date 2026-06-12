@@ -1,6 +1,5 @@
 """
 Modelos de dados compartilhados entre módulos.
-
 Sem dependências internas — apenas dataclasses puras.
 """
 from __future__ import annotations
@@ -12,7 +11,6 @@ from typing import Any, Dict, List, Optional
 @dataclass
 class BlocoCupom:
     """Cupom fiscal extraído do PDF."""
-
     texto_bruto: str
     numero_sat: Optional[str] = None
     numero_ecf: Optional[str] = None
@@ -27,8 +25,7 @@ class BlocoCupom:
 
 @dataclass
 class MovimentoAudit:
-    """Linha da aba AUDIT_TICKETS do export."""
-
+    """Linha da aba de auditoria do export."""
     numero_cupom: str
     json_bruto: Dict[str, Any] = field(default_factory=dict)
     codigo_status: Optional[int] = None
@@ -43,7 +40,6 @@ class MovimentoAudit:
 @dataclass
 class ResultadoCheck:
     """Resultado de uma verificação individual."""
-
     nome_check: str
     aprovado: bool
     detalhe: str = ""
@@ -52,7 +48,6 @@ class ResultadoCheck:
 @dataclass
 class ResultadoTeste:
     """Resultado completo de uma linha do roteiro."""
-
     etapa: str
     linha: int
     chave_cupom: str = ""
