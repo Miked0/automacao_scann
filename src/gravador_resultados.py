@@ -1,184 +1,178 @@
 """
-Módulo 6 — ResultWriter (gravador_resultados — v2 — corrigido BUG-02 e BUG-04)
-Responsabilidade: Preenche colunas de resultado + salva xlsx.
+Gravador de resultados no TEMPLATE de roteiro de testes.
 
-Fix BUG-02: _detect_header_row exige ao menos 3 keywords simultâneas na mesma linha.
-Fix BUG-04: preenche os 3 grupos de colunas (SAT/ECF/NFCE) × 3 sub-colunas
-            (Json/Minoristas/Cupom) = 9 colunas + coluna Observacoes.
+Responsabilidade: preencher as colunas de resultado (Ok/Erro) e salvar o xlsx.
 
 Estrutura real do TEMPLATE (linha 7):
-  C1  Teste
-  C2  Tipo Promo
-  C3  Itens da venda
-  C4  Pagamento
-  C5  Observacoes (input)
-  C6  SAT  (número cupom — preenchido pelo QA)
-  C7  ECF  (número cupom)
-  C8  NFCE (número cupom)
-  C9  Sub-Total
-  C10 Desconto
-  C11 Total
-  ── Grupo SAT ──
-  C12 Json
-  C13 Minoristas
-  C14 Cupom
-  ── Grupo ECF ──
-  C15 Json
-  C16 Minoristas
-  C17 Cupom
-  ── Grupo NFCE ──
-  C18 Json
-  C19 Minoristas
-  C20 Cupom
-  C21 Observacoes (output — justificativa de erro)
+  C1  Teste        C6  SAT          C12-14 Json/Minoristas/Cupom (SAT)
+  C2  Tipo Promo   C7  ECF          C15-17 Json/Minoristas/Cupom (ECF)
+  C3  Itens        C8  NFCE         C18-20 Json/Minoristas/Cupom (NFCE)
+  C4  Pagamento    C9  Sub-Total    C21    Observações (output)
+  C5  Observações  C10 Desconto
+                   C11 Total
 """
-
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 
 import openpyxl
 from openpyxl.styles import PatternFill
 
 logger = logging.getLogger(__name__)
 
-FILL_OK   = PatternFill("solid", fgColor="C6EFCE")
-FILL_ERRO = PatternFill("solid", fgColor="FFC7CE")
-FILL_NA   = PatternFill("solid", fgColor="FFEB9C")
+# Cores de preenchimento para feedback visual no Excel
+PREENCHIMENTO_APROVADO  = PatternFill("solid", fgColor="C6EFCE")  # verde
+PREENCHIMENTO_REPROVADO = PatternFill("solid", fgColor="FFC7CE")  # vermelho
+PREENCHIMENTO_NEUTRO    = PatternFill("solid", fgColor="FFEB9C")  # amarelo
+PREENCHIMENTO_LIMPO     = PatternFill()                           # sem cor
 
-_HEADER_REQUIRED = {"teste", "promo", "pagamento"}
-_HEADER_OPTIONAL = {"desconto", "total", "cupom", "itens", "sub-total", "subtotal", "observ"}
+PALAVRAS_CABECALHO_OBRIGATORIAS = {"teste", "promo", "pagamento"}
+PALAVRAS_CABECALHO_OPCIONAIS    = {
+    "desconto", "total", "cupom", "itens", "sub-total", "subtotal", "observ"
+}
+
+COLUNAS_GRUPOS_FIXOS: Dict[str, tuple] = {
+    "SAT":  (12, 13, 14),
+    "ECF":  (15, 16, 17),
+    "NFCE": (18, 19, 20),
+}
+COLUNA_OBSERVACOES_SAIDA = 21
+
+SUBCOLUNAS_RESULTADO = ("json", "minoristas", "cupom", "cup")
 
 
-def detect_header_row(ws) -> int:
+def detectar_linha_cabecalho(planilha) -> int:
     """
-    Detecta a linha de cabeçalho real exigindo que ao menos 3 palavras-chave
-    obrigatórias estejam presentes na MESMA linha (BUG-02 fix).
-    Retorna número da linha (1-based). Padrão: 1.
+    Detecta a linha de cabeçalho exigindo ao menos 2 palavras-chave obrigatórias
+    na mesma linha — evita falsos positivos em linhas de título ou dados (BUG-02).
     """
-    best_row, best_score = 1, 0
-    for row in ws.iter_rows():
-        values = {str(c.value).lower() for c in row if c.value}
-        req_hits = sum(
-            1 for kw in _HEADER_REQUIRED
-            if any(kw in v for v in values)
+    melhor_linha, melhor_pontuacao = 1, 0
+
+    for linha in planilha.iter_rows():
+        valores_linha = {str(celula.value).lower() for celula in linha if celula.value}
+
+        acertos_obrigatorios = sum(
+            1 for palavra in PALAVRAS_CABECALHO_OBRIGATORIAS
+            if any(palavra in valor for valor in valores_linha)
         )
-        opt_hits = sum(
-            1 for kw in _HEADER_OPTIONAL
-            if any(kw in v for v in values)
+        acertos_opcionais = sum(
+            1 for palavra in PALAVRAS_CABECALHO_OPCIONAIS
+            if any(palavra in valor for valor in valores_linha)
         )
-        score = req_hits * 10 + opt_hits
-        if req_hits >= 2 and score > best_score:
-            best_score = score
-            best_row = row[0].row
-    logger.info("Header detectado na linha %d (score=%d)", best_row, best_score)
-    return best_row
+        pontuacao = acertos_obrigatorios * 10 + acertos_opcionais
+
+        if acertos_obrigatorios >= 2 and pontuacao > melhor_pontuacao:
+            melhor_pontuacao = pontuacao
+            melhor_linha = linha[0].row
+
+    logger.info("Cabeçalho detectado na linha %d (pontuação=%d)", melhor_linha, melhor_pontuacao)
+    return melhor_linha
 
 
-def _find_col_by_keywords(ws, header_row: int, keywords: list[str]) -> Optional[int]:
-    for cell in ws[header_row]:
-        if cell.value:
-            val = str(cell.value).lower()
-            if any(kw.lower() in val for kw in keywords):
-                return cell.column
+def _localizar_coluna_por_palavras(
+    planilha, linha_cabecalho: int, palavras_chave: List[str]
+) -> Optional[int]:
+    """Retorna o índice da coluna cujo cabeçalho contenha alguma das palavras-chave."""
+    for celula in planilha[linha_cabecalho]:
+        if celula.value:
+            valor = str(celula.value).lower()
+            if any(palavra.lower() in valor for palavra in palavras_chave):
+                return celula.column
     return None
 
 
-class ResultWriter:
+class GravadorResultados:
     """
-    Escreve resultados nos 3 grupos de colunas (SAT/ECF/NFCE) do TEMPLATE e salva o xlsx.
+    Preenche as colunas de resultado (Ok/Erro) nos 3 grupos SAT/ECF/NFCE
+    e salva o arquivo xlsx ao final.
     """
 
-    _FIXED_GROUPS = {
-        "SAT":  (12, 13, 14),
-        "ECF":  (15, 16, 17),
-        "NFCE": (18, 19, 20),
-    }
-    _COL_OBS_OUTPUT = 21
+    def __init__(self, pasta_trabalho: openpyxl.Workbook, caminho_saida: str):
+        self.pasta_trabalho = pasta_trabalho
+        self.caminho_saida  = Path(caminho_saida)
+        self.planilha       = pasta_trabalho.active
 
-    def __init__(self, workbook: openpyxl.Workbook, output_path: str):
-        self.wb = workbook
-        self.output_path = Path(output_path)
-        self.ws = workbook.active
-
-        self.header_row = detect_header_row(self.ws)
-        self.groups = self._detect_result_groups()
-        self.col_obs = self._detect_obs_col()
+        self.linha_cabecalho = detectar_linha_cabecalho(self.planilha)
+        self.grupos          = self._detectar_grupos_resultado()
+        self.coluna_observacoes = self._detectar_coluna_observacoes()
 
         logger.info(
-            "ResultWriter inicializado | header_row=%d | grupos=%s | col_obs=%d",
-            self.header_row, self.groups, self.col_obs,
+            "GravadorResultados pronto | cabeçalho=linha %d | grupos=%s | obs=col %d",
+            self.linha_cabecalho, self.grupos, self.coluna_observacoes,
         )
 
-    def _detect_result_groups(self) -> dict:
-        group_row = self.header_row - 1
-        groups: dict[str, list[int]] = {"SAT": [], "ECF": [], "NFCE": []}
+    def _detectar_grupos_resultado(self) -> Dict[str, List[int]]:
+        """
+        Tenta detectar os grupos SAT/ECF/NFCE dinamicamente pela linha acima do cabeçalho.
+        Usa colunas fixas como fallback caso a detecção dinâmica falhe.
+        """
+        linha_grupo = self.linha_cabecalho - 1
+        grupos: Dict[str, List[int]] = {"SAT": [], "ECF": [], "NFCE": []}
 
-        if group_row >= 1:
-            current_group = None
-            for cell in self.ws[group_row]:
-                if cell.value:
-                    val = str(cell.value).upper()
-                    for g in ("SAT", "ECF", "NFCE"):
-                        if g in val:
-                            current_group = g
+        if linha_grupo >= 1:
+            grupo_atual = None
+            for celula in self.planilha[linha_grupo]:
+                if celula.value:
+                    valor = str(celula.value).upper()
+                    for nome_grupo in ("SAT", "ECF", "NFCE"):
+                        if nome_grupo in valor:
+                            grupo_atual = nome_grupo
                             break
-                if current_group:
-                    sub = self.ws.cell(row=self.header_row, column=cell.column).value
-                    if sub and str(sub).lower() in ("json", "minoristas", "cupom", "cup"):
-                        groups[current_group].append(cell.column)
+                if grupo_atual:
+                    subcoluna = self.planilha.cell(
+                        row=self.linha_cabecalho, column=celula.column
+                    ).value
+                    if subcoluna and str(subcoluna).lower() in SUBCOLUNAS_RESULTADO:
+                        grupos[grupo_atual].append(celula.column)
 
-        for name, cols in groups.items():
-            if len(cols) != 3:
-                logger.warning(
-                    "Grupo %s não detectado dinamicamente (%d cols), usando fixo.",
-                    name, len(cols)
-                )
-                groups = {
-                    "SAT":  list(self._FIXED_GROUPS["SAT"]),
-                    "ECF":  list(self._FIXED_GROUPS["ECF"]),
-                    "NFCE": list(self._FIXED_GROUPS["NFCE"]),
-                }
-                break
+        todos_detectados = all(len(cols) == 3 for cols in grupos.values())
+        if not todos_detectados:
+            # Detecção dinâmica falhou — estrutura do TEMPLATE diferente do esperado
+            logger.warning("Grupos não detectados dinamicamente. Usando colunas fixas.")
+            return {nome: list(cols) for nome, cols in COLUNAS_GRUPOS_FIXOS.items()}
 
-        return groups
+        return grupos
 
-    def _detect_obs_col(self) -> int:
-        last_result_col = max(
-            max(cols) for cols in self.groups.values()
+    def _detectar_coluna_observacoes(self) -> int:
+        ultima_coluna_resultado = max(
+            max(colunas) for colunas in self.grupos.values()
         )
-        for col_idx in range(last_result_col + 1, last_result_col + 4):
-            cell = self.ws.cell(row=self.header_row, column=col_idx)
-            if cell.value and "obs" in str(cell.value).lower():
-                return col_idx
-        return self._COL_OBS_OUTPUT
+        for indice_col in range(ultima_coluna_resultado + 1, ultima_coluna_resultado + 4):
+            celula = self.planilha.cell(row=self.linha_cabecalho, column=indice_col)
+            if celula.value and "obs" in str(celula.value).lower():
+                return indice_col
+        return COLUNA_OBSERVACOES_SAIDA
 
-    def write_result(self, result, data_row: int) -> None:
-        status = "Ok" if result.passed else "Erro"
-        fill   = FILL_OK if result.passed else FILL_ERRO
+    def gravar_resultado(self, resultado, linha_dados: int) -> None:
+        """Preenche as células de resultado com Ok/Erro e aplica cor de fundo."""
+        texto_status  = "Ok" if resultado.passed else "Erro"
+        preenchimento = PREENCHIMENTO_APROVADO if resultado.passed else PREENCHIMENTO_REPROVADO
 
-        for group_name, cols in self.groups.items():
-            for col in cols:
-                cell = self.ws.cell(row=data_row, column=col)
-                cell.value = status
-                cell.fill  = fill
+        for colunas in self.grupos.values():
+            for coluna in colunas:
+                celula = self.planilha.cell(row=linha_dados, column=coluna)
+                celula.value = texto_status
+                celula.fill  = preenchimento
 
-        obs_cell = self.ws.cell(row=data_row, column=self.col_obs)
-        if not result.passed:
-            obs_cell.value = result.motivo_erro[:100]
-        else:
-            obs_cell.value = ""
+        celula_obs = self.planilha.cell(row=linha_dados, column=self.coluna_observacoes)
+        celula_obs.value = resultado.motivo_erro[:100] if not resultado.passed else ""
 
-    def clear_result_row(self, data_row: int) -> None:
-        for cols in self.groups.values():
-            for col in cols:
-                cell = self.ws.cell(row=data_row, column=col)
-                cell.value = None
-                cell.fill  = PatternFill()
-        obs_cell = self.ws.cell(row=data_row, column=self.col_obs)
-        obs_cell.value = None
-        obs_cell.fill  = PatternFill()
+    def limpar_linha(self, linha_dados: int) -> None:
+        """Remove valores e formatação das células de resultado de uma linha."""
+        for colunas in self.grupos.values():
+            for coluna in colunas:
+                celula = self.planilha.cell(row=linha_dados, column=coluna)
+                celula.value = None
+                celula.fill  = PREENCHIMENTO_LIMPO
 
-    def save(self) -> None:
-        self.wb.save(self.output_path)
-        logger.info("Resultado salvo em: %s", self.output_path)
+        celula_obs = self.planilha.cell(row=linha_dados, column=self.coluna_observacoes)
+        celula_obs.value = None
+        celula_obs.fill  = PREENCHIMENTO_LIMPO
+
+    def salvar(self) -> None:
+        self.pasta_trabalho.save(self.caminho_saida)
+        logger.info("Resultado salvo em: %s", self.caminho_saida)
+
+
+# Alias de compatibilidade — mantido enquanto __init__.py referencia ResultWriter
+ResultWriter = GravadorResultados

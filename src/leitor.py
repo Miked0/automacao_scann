@@ -1,40 +1,29 @@
 """
-Leitor da planilha de roteiro de testes (leitor).
+Leitor da planilha de roteiro de testes.
 
-Estrutura real do TEMPLATE:
-  Linha 7  → cabeçalho das colunas.
-  Linha 8+ → linhas de teste (não-sequenciais: podem ter vazios entre elas).
+Estrutura esperada do TEMPLATE:
+  Linha 7  → cabeçalho das colunas
+  Linha 8+ → casos de teste (podem ter linhas vazias entre eles)
 
-  Colunas de entrada (preenchidas pelo QA antes da execução):
-    A  → Teste (número/id do caso)
-    B  → Tipo Promo
-    C  → Itens da venda
-    D  → Pagamento
-    E  → Observacoes
-    F  → SAT   (número do cupom SAT  — preenchido pelo parceiro ou QA)
-    G  → ECF   (número ECF/COO)
-    H  → NFCE  (número NFC-e)
-    I  → Sub-Total
-    J  → Desconto
-    K  → Total
-    L  → Json  (status da requisição)
-    ...
+  Colunas de entrada (preenchidas pelo QA):
+    A  → Teste          D  → Pagamento      H  → NFCE
+    B  → Tipo Promo     E  → Observações   I  → Sub-Total
+    C  → Itens da venda F  → SAT            J  → Desconto
+                        G  → ECF            K  → Total
 
   Colunas de resultado (preenchidas pelo script):
-    R(18), S(19), T(20) → Ok/Erro por canal (SAT/ECF/NFCE)
-    U(21)               → Justificativa do erro
+    R-T (18-20) → Ok/Erro por canal (SAT/ECF/NFCE)
+    U   (21)    → Justificativa do erro
 
-  Os campos SAT/ECF/NFCE das colunas F/G/H são lidos como
-  número do cupom para busca no Audit e no PDF.
+  SAT/ECF/NFCE são lidos como número de cupom para busca no Audit e no PDF.
 """
-
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import unicodedata
 
 import pandas as pd
 
-COLUMN_ALIASES: Dict[str, List[str]] = {
+ALIASES_COLUNAS: Dict[str, List[str]] = {
     "teste":           ["teste", "test", "caso", "cenario", "cenário"],
     "tipo_promo":      ["tipo promo", "tipo promocion", "tipo promoção", "tipo_promo"],
     "numero_sat":      ["sat"],
@@ -51,123 +40,149 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
     "bin_raw":         ["bin"],
 }
 
-REQUIRED_COLS = {"teste", "total_raw"}
-DEFAULT_HEADER_ROW = 7
+COLUNAS_OBRIGATORIAS  = {"teste", "total_raw"}
+LINHA_CABECALHO_PADRAO = 7
+VALORES_CELULA_VAZIA  = ("", "nan", "None")
 
 
-def _norm(value: Any) -> str:
-    s = str(value).strip().lower()
-    s = unicodedata.normalize("NFKD", s)
-    return "".join(c for c in s if not unicodedata.combining(c))
+def _normalizar_coluna(valor: Any) -> str:
+    """Remove acentos e normaliza texto para comparação de cabeçalhos."""
+    texto = unicodedata.normalize("NFKD", str(valor).strip().lower())
+    return "".join(char for char in texto if not unicodedata.combining(char))
 
 
-def _match_columns(row: List[Any]) -> Dict[str, int]:
-    normalized = [_norm(c) for c in row]
-    mapping: Dict[str, int] = {}
-    for internal, aliases in COLUMN_ALIASES.items():
-        for i, col in enumerate(normalized):
-            if any(col == alias or alias in col for alias in aliases):
-                if internal not in mapping:
-                    mapping[internal] = i
+def _mapear_colunas(linha: List[Any]) -> Dict[str, int]:
+    """
+    Tenta mapear as colunas da linha ao modelo interno via ALIASES_COLUNAS.
+    Retorna dict vazio se as colunas obrigatórias não forem encontradas.
+    """
+    colunas_normalizadas = [_normalizar_coluna(col) for col in linha]
+    mapeamento: Dict[str, int] = {}
+
+    for campo_interno, aliases in ALIASES_COLUNAS.items():
+        for indice, coluna in enumerate(colunas_normalizadas):
+            if any(coluna == alias or alias in coluna for alias in aliases):
+                if campo_interno not in mapeamento:
+                    mapeamento[campo_interno] = indice
                 break
-    if REQUIRED_COLS.issubset(mapping.keys()):
-        return mapping
+
+    if COLUNAS_OBRIGATORIAS.issubset(mapeamento.keys()):
+        return mapeamento
     return {}
 
 
-def _is_empty_row(row: pd.Series) -> bool:
-    return all(str(v).strip() in ("", "nan", "None") for v in row.values)
+def _linha_vazia(linha: pd.Series) -> bool:
+    return all(str(celula).strip() in VALORES_CELULA_VAZIA for celula in linha.values)
 
 
-def _safe_val(raw) -> Optional[str]:
-    if raw is None:
+def _valor_seguro(valor_bruto: Any) -> Optional[str]:
+    """Retorna None para células vazias, NaN ou None do pandas."""
+    if valor_bruto is None:
         return None
-    s = str(raw).strip()
-    return None if s in ("", "nan", "None") else s
+    texto = str(valor_bruto).strip()
+    return None if texto in VALORES_CELULA_VAZIA else texto
 
 
-def _find_header_row(df: pd.DataFrame, preferred_row: int = DEFAULT_HEADER_ROW) -> int:
-    preferred_idx = preferred_row - 1
-    if preferred_idx < len(df):
-        if _match_columns(list(df.iloc[preferred_idx].values)):
-            print(f"[INFO] Cabeçalho na linha {preferred_row} (padrão do TEMPLATE).")
-            return preferred_idx
+def _localizar_linha_cabecalho(
+    dataframe: pd.DataFrame,
+    linha_preferida: int = LINHA_CABECALHO_PADRAO,
+) -> int:
+    """
+    Localiza a linha de cabeçalho no dataframe.
 
-    for idx in range(len(df)):
-        if _match_columns(list(df.iloc[idx].values)):
-            print(f"[INFO] Cabeçalho detectado por varredura na linha {idx + 1}.")
-            return idx
+    Tenta primeiro a linha padrão do TEMPLATE (linha 7).
+    Faz varredura completa como fallback caso o arquivo seja diferente do padrão.
+    """
+    indice_preferido = linha_preferida - 1
+
+    if indice_preferido < len(dataframe):
+        if _mapear_colunas(list(dataframe.iloc[indice_preferido].values)):
+            print(f"[INFO] Cabeçalho na linha {linha_preferida} (padrão do TEMPLATE).")
+            return indice_preferido
+
+    for indice in range(len(dataframe)):
+        if _mapear_colunas(list(dataframe.iloc[indice].values)):
+            print(f"[INFO] Cabeçalho detectado por varredura na linha {indice + 1}.")
+            return indice
 
     raise ValueError(
         f"Nenhum cabeçalho válido encontrado. "
-        f"Verifique se as colunas obrigatórias ({REQUIRED_COLS}) estão presentes."
+        f"Verifique se as colunas obrigatórias ({COLUNAS_OBRIGATORIAS}) estão presentes."
     )
 
 
-def _extract_test_rows(
-    df: pd.DataFrame,
-    header_idx: int,
-    col_map: Dict[str, int],
+def _consolidar_numero_cupom(registro: Dict[str, Any]) -> Optional[str]:
+    """Retorna o primeiro número de cupom disponível entre SAT, ECF e NFCE."""
+    return (
+        registro.get("numero_sat")
+        or registro.get("numero_ecf")
+        or registro.get("numero_nfce")
+    )
+
+
+def _extrair_linhas_de_teste(
+    dataframe: pd.DataFrame,
+    indice_cabecalho: int,
+    mapeamento_colunas: Dict[str, int],
 ) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    teste_col = col_map["teste"]
+    casos: List[Dict[str, Any]] = []
+    indice_coluna_teste = mapeamento_colunas["teste"]
 
-    for df_idx in range(header_idx + 1, len(df)):
-        row        = df.iloc[df_idx]
-        xlsx_row   = df_idx + 1
+    for indice_df in range(indice_cabecalho + 1, len(dataframe)):
+        linha     = dataframe.iloc[indice_df]
+        linha_xlsx = indice_df + 1
 
-        if _is_empty_row(row):
+        if _linha_vazia(linha):
             continue
 
-        teste_val = _safe_val(row.iloc[teste_col])
-        if not teste_val:
+        identificador = _valor_seguro(linha.iloc[indice_coluna_teste])
+        if not identificador:
             continue
 
-        record: Dict[str, Any] = {"xlsx_row": xlsx_row}
+        registro: Dict[str, Any] = {"xlsx_row": linha_xlsx}
 
-        for field, col_idx in col_map.items():
-            record[field] = _safe_val(row.iloc[col_idx])
+        for campo, indice_col in mapeamento_colunas.items():
+            registro[campo] = _valor_seguro(linha.iloc[indice_col])
 
-        record["numero_cupom"] = (
-            record.get("numero_sat")
-            or record.get("numero_ecf")
-            or record.get("numero_nfce")
-        )
+        registro["numero_cupom"] = _consolidar_numero_cupom(registro)
+        casos.append(registro)
 
-        rows.append(record)
-
-    return rows
+    return casos
 
 
-def load_roteiro_tests(
-    path: Path,
-    header_row: int = DEFAULT_HEADER_ROW,
+def carregar_casos_do_roteiro(
+    caminho: Path,
+    linha_cabecalho: int = LINHA_CABECALHO_PADRAO,
 ) -> List[Dict[str, Any]]:
     """
-    Carrega o roteiro e devolve lista de registros no modelo interno.
+    Carrega o roteiro e devolve lista de casos de teste no modelo interno.
 
     Cada registro contém:
-      - xlsx_row      : número real da linha no Excel (1-based)
-      - numero_cupom  : número consolidado SAT/ECF/NFCE para busca
-      - numero_sat    : valor bruto da coluna SAT
-      - numero_ecf    : valor bruto da coluna ECF
-      - numero_nfce   : valor bruto da coluna NFCE
-      - total_raw, desconto_raw, subtotal_raw, pagamento_raw, observacoes_raw...
+      xlsx_row     — número real da linha no Excel (base 1)
+      numero_cupom — primeiro número disponível entre SAT/ECF/NFCE
+      numero_sat, numero_ecf, numero_nfce — valores brutos por canal
+      total_raw, desconto_raw, subtotal_raw, pagamento_raw, observacoes_raw
     """
-    df         = pd.read_excel(path, header=None, dtype=str)
-    header_idx = _find_header_row(df, preferred_row=header_row)
-    col_map    = _match_columns(list(df.iloc[header_idx].values))
+    dataframe         = pd.read_excel(caminho, header=None, dtype=str)
+    indice_cabecalho  = _localizar_linha_cabecalho(dataframe, linha_preferida=linha_cabecalho)
+    mapeamento_colunas = _mapear_colunas(list(dataframe.iloc[indice_cabecalho].values))
 
-    rows = _extract_test_rows(df, header_idx, col_map)
+    casos = _extrair_linhas_de_teste(dataframe, indice_cabecalho, mapeamento_colunas)
 
-    print(f"[INFO] {len(rows)} caso(s) de teste carregado(s) ")
-    if rows:
-        sample = rows[0]
-        print(f"  Amostra linha {sample['xlsx_row']}: "
-              f"teste={sample.get('teste')} "
-              f"SAT={sample.get('numero_sat')} "
-              f"ECF={sample.get('numero_ecf')} "
-              f"NFCE={sample.get('numero_nfce')} "
-              f"total={sample.get('total_raw')}")
+    print(f"[INFO] {len(casos)} caso(s) de teste carregado(s)")
+    if casos:
+        amostra = casos[0]
+        print(
+            f"  Amostra linha {amostra['xlsx_row']}: "
+            f"teste={amostra.get('teste')} "
+            f"SAT={amostra.get('numero_sat')} "
+            f"ECF={amostra.get('numero_ecf')} "
+            f"NFCE={amostra.get('numero_nfce')} "
+            f"total={amostra.get('total_raw')}"
+        )
 
-    return rows
+    return casos
+
+
+# Alias de compatibilidade — mantido enquanto main.py ainda referencia load_roteiro_tests
+load_roteiro_tests = carregar_casos_do_roteiro
