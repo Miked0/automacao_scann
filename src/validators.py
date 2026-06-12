@@ -1,3 +1,4 @@
 # Este arquivo foi renomeado para validadores.py
-# from validadores import validate_test_case
-raise ImportError("Use 'from validadores import validate_test_case' no lugar deste módulo.")
+# Importe a partir do módulo correto:
+#   from validadores import validar_caso_de_teste
+raise ImportError("Use 'from validadores import validar_caso_de_teste' no lugar deste módulo.")

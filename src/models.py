@@ -1,3 +1,4 @@
 # Este arquivo foi renomeado para modelos.py
-# from modelos import CouponBlock, AuditMovement, CheckResult, TestResult
+# Importe a partir do módulo correto:
+#   from modelos import CupomBloco, MovimentoAuditoria, ResultadoCheck, ResultadoTeste
 raise ImportError("Use 'from modelos import ...' no lugar deste módulo.")

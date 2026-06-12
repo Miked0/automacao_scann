@@ -1,3 +1,4 @@
 # Este arquivo foi renomeado para exportadores.py
-# from exportadores import export_results
-raise ImportError("Use 'from exportadores import export_results' no lugar deste módulo.")
+# Importe a partir do módulo correto:
+#   from exportadores import exportar_resultados
+raise ImportError("Use 'from exportadores import exportar_resultados' no lugar deste módulo.")
