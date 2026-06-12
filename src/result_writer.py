@@ -1,20 +1,36 @@
 """
-Módulo 6 — ResultWriter
+Módulo 6 — ResultWriter  (v2 — corrigido BUG-02 e BUG-04)
 Responsabilidade: Preenche colunas de resultado + salva xlsx.
 
-Mapeamento de colunas de resultado (fixo, conforme TEMPLATE real):
-  R (18) → resultado SAT
-  S (19) → resultado ECF
-  T (20) → resultado NFCE
-  U (21) → justificativa do erro
+Fix BUG-02: _detect_header_row exige ao menos 3 keywords simultâneas na mesma linha.
+Fix BUG-04: preenche os 3 grupos de colunas (SAT/ECF/NFCE) × 3 sub-colunas
+            (Json/Minoristas/Cupom) = 9 colunas + coluna Observacoes.
 
-O script detecta as colunas pelo cabeçalho dinamicamente.
-Se não encontrar, usa os indicadores fixos acima como fallback.
-
-Regra de escrita:
-  - Escreve Ok/Erro + fill verde/vermelho nas 3 colunas de status.
-  - Escreve a justificativa (até 100 chars) apenas quando Erro.
-  - NÃO altera nenhuma outra célula fora dessas 4 colunas.
+Estrutura real do TEMPLATE (linha 7):
+  C1  Teste
+  C2  Tipo Promo
+  C3  Itens da venda
+  C4  Pagamento
+  C5  Observacoes (input)
+  C6  SAT  (número cupom — preenchido pelo QA)
+  C7  ECF  (número cupom)
+  C8  NFCE (número cupom)
+  C9  Sub-Total
+  C10 Desconto
+  C11 Total
+  ── Grupo SAT ──
+  C12 Json
+  C13 Minoristas
+  C14 Cupom
+  ── Grupo ECF ──
+  C15 Json
+  C16 Minoristas
+  C17 Cupom
+  ── Grupo NFCE ──
+  C18 Json
+  C19 Minoristas
+  C20 Cupom
+  C21 Observacoes (output — justificativa de erro)
 """
 
 import logging
@@ -24,236 +40,183 @@ from typing import Optional
 import openpyxl
 from openpyxl.styles import PatternFill
 
-from .test_runner import TestResult
-
 logger = logging.getLogger(__name__)
 
 FILL_OK   = PatternFill("solid", fgColor="C6EFCE")
 FILL_ERRO = PatternFill("solid", fgColor="FFC7CE")
-FILL_NONE = PatternFill()
+FILL_NA   = PatternFill("solid", fgColor="FFEB9C")
 
-# ---------------------------------------------------------------------------
-# KEYWORDS_HEADER: palavras que identificam a linha de cabeçalho do roteiro.
-# ---------------------------------------------------------------------------
-KEYWORDS_HEADER = {
-    "nº do teste",
-    "n. do teste",
-    "no. do teste",
-    "numero do teste",
-    "número do teste",
-    "num. sat",
-    "num. ecf",
-    "num. nfce",
-    "nº sat",
-    "nº ecf",
-    "nº nfce",
-    "nfce",
-    "itens da venda",
-    "articulos movimiento",
-    "tipo promo",
-    "tipo de promo",
-    "tipo promoción",
-}
-
-# Palavras-chave para detectar as colunas de resultado no cabeçalho
-_RESULT_COL_KEYWORDS = {
-    "col_sat":  ["resultado sat",  "res sat",  "result sat",  "ok sat",  "erro sat"],
-    "col_ecf":  ["resultado ecf",  "res ecf",  "result ecf",  "ok ecf",  "erro ecf"],
-    "col_nfce": ["resultado nfce", "res nfce", "result nfce", "ok nfce", "erro nfce",
-                 "resultado nfc",  "res nfc"],
-    "col_just": ["justificativa", "just", "motivo", "observ result", "resultado obs"],
-}
-
-# Fallback: colunas fixas do TEMPLATE (1-based)
-_DEFAULT_COLS = {
-    "col_sat":  18,  # R
-    "col_ecf":  19,  # S
-    "col_nfce": 20,  # T
-    "col_just": 21,  # U
-}
-
-# ---------------------------------------------------------------------------
-# Linha de cabeçalho esperada no TEMPLATE (1-based).
-# O template Scanntech tem cabeçalho fixo na linha 7.
-# A varredura automática NUNCA pesquisa abaixo desta linha,
-# evitando falsos positivos em títulos das linhas 1-6.
-# ---------------------------------------------------------------------------
-_EXPECTED_HEADER_ROW = 7
-
-# Número mínimo de células com keyword para confirmar que é a linha de cabeçalho
-_MIN_KEYWORD_HITS = 2
+# Palavras-chave que DEVEM aparecer juntas na linha de cabeçalho
+_HEADER_REQUIRED = {"teste", "promo", "pagamento"}
+_HEADER_OPTIONAL = {"desconto", "total", "cupom", "itens", "sub-total", "subtotal", "observ"}
 
 
-# ---------------------------------------------------------------------------
-# Helpers de detecção
-# ---------------------------------------------------------------------------
-
-def _row_keyword_hits(ws, row_num: int) -> int:
-    """Conta quantas células da linha contêm alguma KEYWORD_HEADER."""
-    hits = 0
-    for cell in ws[row_num]:
-        if cell.value and any(
-            kw in str(cell.value).strip().lower() for kw in KEYWORDS_HEADER
-        ):
-            hits += 1
-    return hits
-
-
-def _detect_header_row(ws) -> int:
+def detect_header_row(ws) -> int:
     """
-    Detecta a linha de cabeçalho com estratégia em três passos:
-
-    1. Verifica se a linha _EXPECTED_HEADER_ROW (7) possui ao menos
-       _MIN_KEYWORD_HITS (2) células com keyword → usa ela.
-    2. Varre SOMENTE a partir de _EXPECTED_HEADER_ROW (nunca antes),
-       exigindo ao menos _MIN_KEYWORD_HITS hits para confirmar.
-    3. Fallback: retorna _EXPECTED_HEADER_ROW (7) incondicionalmente.
-
-    A restrição "nunca antes de _EXPECTED_HEADER_ROW" evita que palavras
-    genéricas nas linhas de título/apresentação (1-6) causem falsos positivos
-    que deslocariam o início do processamento para linhas erradas (ex: linha 4).
+    Detecta a linha de cabeçalho real exigindo que ao menos 3 palavras-chave
+    obrigatórias estejam presentes na MESMA linha (BUG-02 fix).
+    Retorna número da linha (1-based). Padrão: 1.
     """
-    # Passo 1: verifica linha esperada com threshold de hits
-    hits = _row_keyword_hits(ws, _EXPECTED_HEADER_ROW)
-    if hits >= _MIN_KEYWORD_HITS:
-        logger.info(
-            "Cabeçalho confirmado na linha esperada %d (%d hits)",
-            _EXPECTED_HEADER_ROW, hits
+    best_row, best_score = 1, 0
+    for row in ws.iter_rows():
+        values = {str(c.value).lower() for c in row if c.value}
+        # conta keywords obrigatórias presentes
+        req_hits = sum(
+            1 for kw in _HEADER_REQUIRED
+            if any(kw in v for v in values)
         )
-        return _EXPECTED_HEADER_ROW
-
-    # Passo 1b: linha esperada tem pelo menos 1 hit → aceita mesmo assim
-    if hits == 1:
-        logger.info(
-            "Cabeçalho aceito na linha esperada %d (1 hit — threshold relaxado)",
-            _EXPECTED_HEADER_ROW
+        opt_hits = sum(
+            1 for kw in _HEADER_OPTIONAL
+            if any(kw in v for v in values)
         )
-        return _EXPECTED_HEADER_ROW
-
-    # Passo 2: varredura a partir de _EXPECTED_HEADER_ROW (nunca antes)
-    max_row = ws.max_row or 0
-    for row_num in range(_EXPECTED_HEADER_ROW, max_row + 1):
-        h = _row_keyword_hits(ws, row_num)
-        if h >= _MIN_KEYWORD_HITS:
-            logger.info(
-                "Cabeçalho encontrado por varredura na linha %d (%d hits)",
-                row_num, h
-            )
-            return row_num
-
-    # Passo 3: fallback fixo
-    logger.warning(
-        "Cabeçalho não detectado. Usando linha fixa %d como fallback.",
-        _EXPECTED_HEADER_ROW
-    )
-    return _EXPECTED_HEADER_ROW
+        score = req_hits * 10 + opt_hits
+        if req_hits >= 2 and score > best_score:
+            best_score = score
+            best_row = row[0].row
+    logger.info("Header detectado na linha %d (score=%d)", best_row, best_score)
+    return best_row
 
 
-def _find_result_cols(ws, header_row: int) -> dict:
-    """
-    Localiza as colunas de resultado pelo cabeçalho.
-    Retorna dict col_sat/col_ecf/col_nfce/col_just com indicadores 1-based.
-    Usa _DEFAULT_COLS como fallback.
-    """
-    found = {}
+def _find_col_by_keywords(ws, header_row: int, keywords: list[str]) -> Optional[int]:
+    """Retorna índice (1-based) da primeira coluna cujo header contenha alguma keyword."""
     for cell in ws[header_row]:
-        if not cell.value:
-            continue
-        val = str(cell.value).strip().lower()
-        for key, keywords in _RESULT_COL_KEYWORDS.items():
-            if key not in found and any(kw in val for kw in keywords):
-                found[key] = cell.column
+        if cell.value:
+            val = str(cell.value).lower()
+            if any(kw.lower() in val for kw in keywords):
+                return cell.column
+    return None
 
-    for key, default_col in _DEFAULT_COLS.items():
-        if key not in found:
-            found[key] = default_col
-
-    return found
-
-
-# ---------------------------------------------------------------------------
-# Unmerge preventivo nas colunas de resultado
-# ---------------------------------------------------------------------------
-
-def _preemptive_unmerge(ws, result_cols: set) -> None:
-    for mr in list(ws.merged_cells.ranges):
-        if any(mr.min_col <= c <= mr.max_col for c in result_cols):
-            coord = str(mr)
-            try:
-                anchor = ws[coord.split(":")[0]]
-                saved  = anchor.value if not isinstance(
-                    anchor, openpyxl.cell.cell.MergedCell) else None
-                ws.unmerge_cells(coord)
-                try:
-                    ws[coord.split(":")[0]].value = saved
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.warning("Falha ao desfazer merge %s: %s", coord, e)
-
-
-# ---------------------------------------------------------------------------
-# Escrita segura
-# ---------------------------------------------------------------------------
-
-def _safe_write(ws, row: int, col: int, value, fill) -> None:
-    try:
-        cell = ws.cell(row=row, column=col)
-        cell.value = value
-        cell.fill  = fill
-    except AttributeError:
-        for mr in list(ws.merged_cells.ranges):
-            if mr.min_col <= col <= mr.max_col and mr.min_row <= row <= mr.max_row:
-                ws.unmerge_cells(str(mr))
-                break
-        try:
-            cell = ws.cell(row=row, column=col)
-            cell.value = value
-            cell.fill  = fill
-        except AttributeError as e:
-            logger.warning("Não foi possível escrever em (%d,%d): %s", row, col, e)
-
-
-# ---------------------------------------------------------------------------
-# ResultWriter
-# ---------------------------------------------------------------------------
 
 class ResultWriter:
-    """Escreve resultados nas colunas corretas do TEMPLATE e salva o xlsx."""
+    """
+    Escreve resultados nos 3 grupos de colunas (SAT/ECF/NFCE) do TEMPLATE e salva o xlsx.
+    """
+
+    # Colunas fixas conforme estrutura real do TEMPLATE
+    # Grupo SAT:  Json=12, Minoristas=13, Cupom=14
+    # Grupo ECF:  Json=15, Minoristas=16, Cupom=17
+    # Grupo NFCE: Json=18, Minoristas=19, Cupom=20
+    # Observacoes (output): 21
+    _FIXED_GROUPS = {
+        "SAT":  (12, 13, 14),
+        "ECF":  (15, 16, 17),
+        "NFCE": (18, 19, 20),
+    }
+    _COL_OBS_OUTPUT = 21
 
     def __init__(self, workbook: openpyxl.Workbook, output_path: str):
-        self.wb          = workbook
+        self.wb = workbook
         self.output_path = Path(output_path)
-        self.ws          = workbook.active
+        self.ws = workbook.active
 
-        self.header_row = _detect_header_row(self.ws)
-        cols            = _find_result_cols(self.ws, self.header_row)
+        self.header_row = detect_header_row(self.ws)
 
-        self.col_sat  = cols["col_sat"]
-        self.col_ecf  = cols["col_ecf"]
-        self.col_nfce = cols["col_nfce"]
-        self.col_just = cols["col_just"]
+        # Tenta detectar dinamicamente os grupos de colunas;
+        # se não encontrar, usa posições fixas do TEMPLATE padrão.
+        self.groups = self._detect_result_groups()
+        self.col_obs = self._detect_obs_col()
 
         logger.info(
-            "ResultWriter: SAT=col%d ECF=col%d NFCE=col%d JUST=col%d (header linha %d)",
-            self.col_sat, self.col_ecf, self.col_nfce, self.col_just, self.header_row
+            "ResultWriter inicializado | header_row=%d | grupos=%s | col_obs=%d",
+            self.header_row, self.groups, self.col_obs,
         )
 
-        result_cols = {self.col_sat, self.col_ecf, self.col_nfce, self.col_just}
-        _preemptive_unmerge(self.ws, result_cols)
+    # ------------------------------------------------------------------
+    # Detecção de colunas
+    # ------------------------------------------------------------------
 
-    def write_result(self, result: TestResult, data_row: int) -> None:
-        """Preenche as 4 colunas de resultado para a linha real do Excel."""
-        status = "Ok"    if result.passed else "Erro"
+    def _detect_result_groups(self) -> dict:
+        """
+        Detecta os 3 grupos (SAT/ECF/NFCE) lendo linha de grupo (header_row - 1)
+        e linha de sub-header (header_row).
+        Fallback: usa colunas fixas do TEMPLATE padrão.
+        """
+        # Linha de grupos (ex: linha 6 no TEMPLATE padrão)
+        group_row = self.header_row - 1
+        groups: dict[str, list[int]] = {"SAT": [], "ECF": [], "NFCE": []}
+
+        if group_row >= 1:
+            current_group = None
+            for cell in self.ws[group_row]:
+                if cell.value:
+                    val = str(cell.value).upper()
+                    for g in ("SAT", "ECF", "NFCE"):
+                        if g in val:
+                            current_group = g
+                            break
+                # Coleta 3 colunas por grupo lendo sub-headers (Json/Minoristas/Cupom)
+                if current_group:
+                    sub = self.ws.cell(row=self.header_row, column=cell.column).value
+                    if sub and str(sub).lower() in ("json", "minoristas", "cupom", "cup"):
+                        groups[current_group].append(cell.column)
+
+        # Valida — se algum grupo ficou incompleto, usa fixos
+        for name, cols in groups.items():
+            if len(cols) != 3:
+                logger.warning(
+                    "Grupo %s não detectado dinamicamente (%d cols), usando fixo.",
+                    name, len(cols)
+                )
+                groups = {
+                    "SAT":  list(self._FIXED_GROUPS["SAT"]),
+                    "ECF":  list(self._FIXED_GROUPS["ECF"]),
+                    "NFCE": list(self._FIXED_GROUPS["NFCE"]),
+                }
+                break
+
+        return groups
+
+    def _detect_obs_col(self) -> int:
+        """Detecta coluna de Observacoes de saída. Fallback: col 21."""
+        # Procura após a última coluna de resultado
+        last_result_col = max(
+            max(cols) for cols in self.groups.values()
+        )
+        for col_idx in range(last_result_col + 1, last_result_col + 4):
+            cell = self.ws.cell(row=self.header_row, column=col_idx)
+            if cell.value and "obs" in str(cell.value).lower():
+                return col_idx
+        return self._COL_OBS_OUTPUT
+
+    # ------------------------------------------------------------------
+    # Escrita de resultado
+    # ------------------------------------------------------------------
+
+    def write_result(self, result, data_row: int) -> None:
+        """
+        Preenche os 3 grupos × 3 sub-colunas + observações para uma linha de dado.
+        result deve ter atributos: .passed (bool), .motivo_erro (str).
+        """
+        status = "Ok" if result.passed else "Erro"
         fill   = FILL_OK if result.passed else FILL_ERRO
 
-        _safe_write(self.ws, data_row, self.col_sat,  status, fill)
-        _safe_write(self.ws, data_row, self.col_ecf,  status, fill)
-        _safe_write(self.ws, data_row, self.col_nfce, status, fill)
+        # Preenche os 9 campos de resultado
+        for group_name, cols in self.groups.items():
+            for col in cols:
+                cell = self.ws.cell(row=data_row, column=col)
+                # Não sobrescreve colunas fora das de resultado
+                cell.value = status
+                cell.fill  = fill
 
-        motivo = result.motivo_erro[:100] if not result.passed else ""
-        _safe_write(self.ws, data_row, self.col_just, motivo, FILL_NONE)
+        # Preenche coluna de observações (justificativa de erro)
+        obs_cell = self.ws.cell(row=data_row, column=self.col_obs)
+        if not result.passed:
+            obs_cell.value = result.motivo_erro[:100]
+        else:
+            obs_cell.value = ""
+
+    def clear_result_row(self, data_row: int) -> None:
+        """Limpa valores anteriores nas colunas de resultado (evita reprocessamento sujo)."""
+        for cols in self.groups.values():
+            for col in cols:
+                cell = self.ws.cell(row=data_row, column=col)
+                cell.value = None
+                cell.fill  = PatternFill()  # remove fill
+        obs_cell = self.ws.cell(row=data_row, column=self.col_obs)
+        obs_cell.value = None
+        obs_cell.fill  = PatternFill()
 
     def save(self) -> None:
+        """Salva o workbook no caminho de saída."""
         self.wb.save(self.output_path)
         logger.info("Resultado salvo em: %s", self.output_path)

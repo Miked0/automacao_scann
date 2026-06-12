@@ -1,12 +1,10 @@
-# src/audit_parser.py
 """
-Módulo 2 — AuditParser
+Módulo 2 — AuditParser  (v2 — corrigido BUG-05)
 Responsabilidade: Indexa movimentos do export Audit pelo nº cupom.
 
-fix v4:
-  - _build_index() normaliza a chave via _norm() antes de indexar
-  - get_by_numero() normaliza o argumento antes de buscar
-    → resolve divergência '006221' vs '6221'
+Fix BUG-05: detecta automaticamente o tipo de export:
+  - Se a planilha contiver coluna 'Request' (JSON aninhado) → parseia via json.loads
+  - Se contiver coluna 'NUMERO_DE_CUPON' ou 'NUMERO_CUPON' (tabular) → lê diretamente
 """
 
 import json
@@ -18,31 +16,28 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-
-def _norm(value) -> str:
-    """
-    Normaliza número de cupom: remove .0, zeros à esquerda e sinal negativo.
-    Centralizado aqui para ser importado também pelo TestRunner.
-    """
-    if value is None:
-        return ""
-    s = str(value).strip()
-    if s.endswith(".0") and s[:-2].lstrip("-").isdigit():
-        s = s[:-2]
-    s = s.lstrip("-")
-    s = s.lstrip("0") or "0"
-    if s.lower() in ("0", "none", "nan", "", "-"):
-        return ""
-    return s
+# Tolerância monetária
+TOLERANCE = 0.05
 
 
 class AuditParser:
     """Parseia e indexa o export Audit pelo número do cupom."""
 
+    # Nomes possíveis para coluna de número do cupom no export tabular
+    _CUPON_COLS = [
+        "NUMERO_DE_CUPON", "NUMERO_CUPON", "NUM_CUPON", "CUPON",
+        "numero", "numeroCupon", "number", "NUMERO",
+    ]
+    # Nomes possíveis para colunas de valores no export tabular
+    _TOTAL_COLS   = ["IMPORTE", "TOTAL", "total", "importe", "valorTotal"]
+    _DESC_COLS    = ["DESCUENTO_TOTAL", "descuentoTotal", "DESCUENTO", "descuento"]
+    _STATUS_COLS  = ["STATUS", "HTTP_STATUS", "status", "httpStatus", "CODIGO_RESPUESTA"]
+    _CANCEL_COLS  = ["CANCELACION", "cancelacion", "CANCELADO", "cancelado"]
+
     def __init__(self, audit_df: pd.DataFrame):
         self.audit_df = audit_df
-        # índice: numero_cupom normalizado (str) → lista de movimentos
         self._index: dict[str, list[dict]] = {}
+        self._mode: str = "unknown"
         self._build_index()
 
     # ------------------------------------------------------------------
@@ -50,50 +45,130 @@ class AuditParser:
     # ------------------------------------------------------------------
 
     def _build_index(self) -> None:
-        """Itera o DataFrame e indexa pelo campo 'numero' normalizado."""
+        cols_upper = {str(c).upper(): c for c in self.audit_df.columns}
+
+        # Detecta modo: JSON (coluna Request) ou tabular (colunas separadas)
+        if "REQUEST" in cols_upper:
+            self._mode = "json"
+            logger.info("AuditParser: modo JSON (coluna Request detectada)")
+            self._build_index_json(cols_upper["REQUEST"])
+        else:
+            self._mode = "tabular"
+            logger.info("AuditParser: modo TABULAR (colunas separadas)")
+            self._build_index_tabular(cols_upper)
+
+        logger.info("AuditParser: %d cupons indexados (modo=%s)", len(self._index), self._mode)
+
+    def _build_index_json(self, request_col: str) -> None:
+        """Modo JSON: parseia campo Request de cada linha."""
         for _, row in self.audit_df.iterrows():
-            raw = row.get("Request", "")
+            raw = row.get(request_col, "")
             movement = self._parse_request(str(raw))
             if not movement:
                 continue
+            # Tenta enriquecer com colunas adicionais da linha
+            movement.setdefault("status", row.get("STATUS", row.get("status", 0)))
+            numero = str(movement.get("numero", "")).strip()
+            if numero:
+                self._index.setdefault(numero, []).append(movement)
 
-            # Coleta status HTTP separado (pode vir em coluna própria)
-            http_status = row.get("StatusCode", row.get("Status", row.get("HttpStatus", 0)))
-            if http_status:
-                movement["_http_status"] = int(str(http_status).split(".")[0])
+    def _build_index_tabular(self, cols_upper: dict) -> None:
+        """Modo Tabular: lê colunas separadas diretamente."""
+        # Encontra coluna de número do cupom
+        cupon_col = None
+        for name in self._CUPON_COLS:
+            if name.upper() in cols_upper:
+                cupon_col = cols_upper[name.upper()]
+                break
 
-            # Normaliza o número antes de indexar
-            numero_raw  = str(movement.get("numero", "")).strip()
-            numero_norm = _norm(numero_raw)
+        if not cupon_col:
+            logger.warning("AuditParser tabular: coluna de número de cupom não encontrada. "
+                           "Colunas disponíveis: %s", list(self.audit_df.columns))
+            return
 
-            if numero_norm:
-                self._index.setdefault(numero_norm, []).append(movement)
-                # Também indexa o raw caso haja diferença
-                if numero_raw != numero_norm:
-                    self._index.setdefault(numero_raw, []).append(movement)
+        # Encontra colunas de valores opcionais
+        total_col  = self._find_col(cols_upper, self._TOTAL_COLS)
+        desc_col   = self._find_col(cols_upper, self._DESC_COLS)
+        status_col = self._find_col(cols_upper, self._STATUS_COLS)
+        cancel_col = self._find_col(cols_upper, self._CANCEL_COLS)
 
-        logger.info("AuditParser: %d cupons indexados", len(self._index))
+        logger.info("AuditParser tabular: cupon=%s total=%s desc=%s status=%s cancel=%s",
+                    cupon_col, total_col, desc_col, status_col, cancel_col)
+
+        for _, row in self.audit_df.iterrows():
+            numero = str(row.get(cupon_col, "")).strip()
+            if not numero or numero.lower() in ("nan", "", "none"):
+                continue
+
+            movement: dict = {
+                "numero":        numero,
+                "total":         self._safe_float(row, total_col),
+                "descuentoTotal":self._safe_float(row, desc_col),
+                "status":        self._safe_int(row, status_col, default=200),
+                "cancelacion":   self._safe_bool(row, cancel_col),
+                # Mantém linha original para acesso a campos extras
+                "_raw_row":      row.to_dict(),
+            }
+            # Extrai detalles e pagos se existirem como colunas JSON embutidas
+            for extra in ("detalles", "pagos", "DETALLES", "PAGOS"):
+                if extra.upper() in {c.upper() for c in self.audit_df.columns}:
+                    try:
+                        movement[extra.lower()] = json.loads(str(row.get(extra, "[]"))
+                                                              .replace('""', '"'))
+                    except Exception:
+                        movement[extra.lower()] = []
+
+            self._index.setdefault(numero, []).append(movement)
+
+    @staticmethod
+    def _find_col(cols_upper: dict, candidates: list) -> Optional[str]:
+        for name in candidates:
+            if name.upper() in cols_upper:
+                return cols_upper[name.upper()]
+        return None
+
+    @staticmethod
+    def _safe_float(row, col: Optional[str], default: float = 0.0) -> float:
+        if col is None:
+            return default
+        try:
+            return float(row.get(col, default))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _safe_int(row, col: Optional[str], default: int = 0) -> int:
+        if col is None:
+            return default
+        try:
+            return int(float(row.get(col, default)))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _safe_bool(row, col: Optional[str]) -> bool:
+        if col is None:
+            return False
+        val = str(row.get(col, "")).strip().lower()
+        return val in ("true", "1", "sim", "yes", "s")
+
+    # ------------------------------------------------------------------
+    # Parsing JSON (modo json)
+    # ------------------------------------------------------------------
 
     def _parse_request(self, raw: str) -> Optional[dict]:
-        """
-        Normaliza aspas duplas escapadas e tenta json.loads.
-        Fallback: extrai campos via regex.
-        """
         normalized = raw.replace('""', '"').strip()
         if normalized.startswith('"') and normalized.endswith('"'):
             normalized = normalized[1:-1]
-
         try:
             data = json.loads(normalized)
             if isinstance(data, dict):
                 return data
         except json.JSONDecodeError:
             pass
-
         return self._regex_fallback(normalized)
 
     def _regex_fallback(self, text: str) -> Optional[dict]:
-        """Extrai campos mínimos via regex quando o JSON está malformado."""
         result: dict = {}
         patterns = {
             "numero":        r'"numero"\s*:\s*"([^"]+)"',
@@ -114,7 +189,6 @@ class AuditParser:
                     result[key] = int(val)
                 else:
                     result[key] = val
-
         if "numero" in result:
             logger.warning("Fallback regex usado para cupom %s", result["numero"])
             return result
@@ -124,19 +198,14 @@ class AuditParser:
     # Consultas
     # ------------------------------------------------------------------
 
-    def get_by_numero(self, numero) -> list[dict]:
-        """Busca movimentos normalizando o argumento antes de consultar."""
-        numero_norm = _norm(numero)
-        # Tenta normalizado primeiro, depois raw
-        result = self._index.get(numero_norm, [])
-        if not result:
-            result = self._index.get(str(numero).strip(), [])
-        return result
+    def get_by_numero(self, numero: str) -> list[dict]:
+        """Retorna movimentos indexados pelo número do cupom."""
+        return self._index.get(str(numero).strip(), [])
 
     def get_by_eans(self, eans: list[str]) -> list[dict]:
-        """Fallback: retorna movimentos que contenham ao menos um EAN da lista."""
-        ean_set = set(eans)
+        """Fallback: busca movimentos que contenham ao menos um EAN da lista."""
         results = []
+        ean_set = set(eans)
         for movements in self._index.values():
             for mov in movements:
                 if any(e in self._extract_eans(mov) for e in ean_set):

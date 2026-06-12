@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-scanntech_qa_validator.py
-Orquestrador principal do Scanntech QA Validator.
+scanntech_qa_validator.py  (v2 — orquestrador corrigido)
+
+Correcoes aplicadas:
+  BUG-01/03: extrai numero_sat, numero_ecf, numero_nfce separadamente do header
+  BUG-02/04: usa detect_header_row robusto e preenche 9 colunas de resultado
+  BUG-05:    AuditParser detecta automaticamente modo JSON ou tabular
 
 Uso:
     python scanntech_qa_validator.py \\
@@ -22,12 +26,10 @@ from src.audit_parser      import AuditParser
 from src.coupon_pdf_parser import CouponPDFParser
 from src.promo_engine      import PromoEngine
 from src.test_runner       import TestRunner
-from src.result_writer     import ResultWriter, KEYWORDS_HEADER, _EXPECTED_HEADER_ROW
+from src.result_writer     import ResultWriter, detect_header_row
 from src.audit_logger      import AuditLogger
 
-# ---------------------------------------------------------------------------
-# Logging: arquivo + console simultâneos
-# ---------------------------------------------------------------------------
+# ── Logging: arquivo + console ──────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -40,158 +42,82 @@ logger = logging.getLogger("qa_validator")
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Scanntech QA Validator")
-    p.add_argument("--roteiro",  required=True, help="Caminho do TEMPLATE xlsx")
-    p.add_argument("--audit",    required=True, help="Caminho do Export Audit xlsx")
-    p.add_argument("--pdf",      required=True, help="Caminho do PDF de cupons")
-    p.add_argument("--output",   required=True, help="Caminho do xlsx de saída")
-    p.add_argument("--log",      default="qa_audit_log.json",
-                   help="Caminho do log JSON de auditoria")
-    p.add_argument("--json-dir", default=None,
-                   help="(Opcional) Diretório com JSONs de venda avulsos")
-    p.add_argument("--header-row", type=int, default=None,
-                   help="(Opcional) Força o número da linha de cabeçalho (1-based)")
+    p = argparse.ArgumentParser(description="Scanntech QA Validator v2")
+    p.add_argument("--roteiro",  required=True, help="TEMPLATE xlsx (original, sem preenchimento)")
+    p.add_argument("--audit",    required=True, help="Export Audit xlsx")
+    p.add_argument("--pdf",      required=True, help="PDF de cupons fiscais")
+    p.add_argument("--output",   required=True, help="Caminho do xlsx de saída preenchido")
+    p.add_argument("--log",      default="qa_audit_log.json", help="Log JSON de auditoria")
+    p.add_argument("--json-dir", default=None, help="(Opcional) dir com JSONs avulsos")
     return p.parse_args()
 
 
-# ---------------------------------------------------------------------------
-# Detecção de cabeçalho (mesma lógica do ResultWriter)
-# ---------------------------------------------------------------------------
+# ── Mapeamento de colunas do roteiro ─────────────────────────────────
 
-def _detect_header(wb, forced: int = None) -> int:
+# Chaves de busca para cada coluna do TEMPLATE (case-insensitive)
+_COL_MAP = {
+    "teste":          ["teste"],
+    "tipo_promo":     ["tipo promo", "tipopromo", "tipo_promo", "promo"],
+    "itens":          ["itens", "item", "produto"],
+    "pagamento":      ["pagamento", "payment", "pago"],
+    "observacao":     ["observac", "obs"],
+    "numero_sat":     ["sat"],
+    "numero_ecf":     ["ecf"],
+    "numero_nfce":    ["nfce", "nfc-e", "nfc"],
+    "subtotal":       ["sub-total", "subtotal", "sub total"],
+    "desconto":       ["desconto", "descuento"],
+    "total":          ["total"],
+}
+
+
+def _build_col_index(ws, header_row: int) -> dict[str, int]:
     """
-    Detecta a linha de cabeçalho com estratégia em três passos:
-
-      0. Se --header-row foi passado na CLI, usa diretamente (sem busca).
-      1. Verifica se a linha _EXPECTED_HEADER_ROW (7) tem keyword exclusiva.
-      2. Varredura completa por KEYWORDS_HEADER estritas.
-      3. Fallback: retorna _EXPECTED_HEADER_ROW (7).
-
-    As KEYWORDS_HEADER são exclusivas da linha real de cabeçalho, evitando
-    falsos positivos em títulos ou rodapés das linhas 1-6.
+    Mapeia nomes de campo → índice de coluna (1-based) usando _COL_MAP.
+    BUG-01 fix: numero_sat, numero_ecf, numero_nfce mapeados separadamente.
     """
-    if forced is not None:
-        logger.info("Cabeçalho forçado via --header-row: linha %d", forced)
-        return forced
-
-    ws = wb.active
-
-    # Passo 1: verifica linha esperada
-    for cell in ws[_EXPECTED_HEADER_ROW]:
-        if cell.value and any(
-            kw in str(cell.value).strip().lower() for kw in KEYWORDS_HEADER
-        ):
-            logger.info(
-                "Cabeçalho confirmado na linha esperada %d", _EXPECTED_HEADER_ROW
-            )
-            return _EXPECTED_HEADER_ROW
-
-    # Passo 2: varredura completa
-    for row in ws.iter_rows():
-        for cell in row:
-            if cell.value and any(
-                kw in str(cell.value).strip().lower() for kw in KEYWORDS_HEADER
-            ):
-                logger.info(
-                    "Cabeçalho encontrado por varredura na linha %d", cell.row
-                )
-                return cell.row
-
-    # Passo 3: fallback
-    logger.warning(
-        "Cabeçalho não detectado. Usando fallback linha %d.", _EXPECTED_HEADER_ROW
-    )
-    return _EXPECTED_HEADER_ROW
-
-
-# ---------------------------------------------------------------------------
-# Leitura de linhas do roteiro
-# ---------------------------------------------------------------------------
-
-def _resolve_merged_headers(ws, header_row: int) -> dict:
-    """
-    Constrói mapa col_index -> nome_header resolvendo células mescladas.
-    """
-    col_map: dict[int, str] = {}
+    index: dict[str, int] = {}
     for cell in ws[header_row]:
-        if cell.value is not None:
-            col_map[cell.column] = str(cell.value).strip().lower()
-
-    for mr in ws.merged_cells.ranges:
-        if mr.min_row <= header_row <= mr.max_row:
-            anchor_val = ws.cell(row=mr.min_row, column=mr.min_col).value
-            if anchor_val is None:
-                continue
-            anchor_str = str(anchor_val).strip().lower()
-            for col_idx in range(mr.min_col, mr.max_col + 1):
-                if col_idx not in col_map:
-                    col_map[col_idx] = anchor_str
-
-    max_col = ws.max_column or 0
-    for col_idx in range(1, max_col + 1):
-        if col_idx not in col_map:
-            col_map[col_idx] = f"col_{col_idx}"
-
-    logger.debug("Headers detectados: %s", col_map)
-    return col_map
+        if not cell.value:
+            continue
+        val = str(cell.value).lower().strip()
+        for field_name, keywords in _COL_MAP.items():
+            if field_name not in index and any(kw in val for kw in keywords):
+                # Evita que 'total' sobrescreva 'subtotal'
+                if field_name == "total" and "sub" in val:
+                    continue
+                # Evita que 'observacao' do input (C5) seja confundido com output (C21)
+                # O input está antes das colunas de número; o output depois.
+                index[field_name] = cell.column
+    return index
 
 
-def _is_test_row(row_values: tuple) -> bool:
-    """
-    Linha de teste válida: Coluna A (index 0) deve ter conteúdo não vazio.
-    Linhas de agrupamento/espaçamento têm Coluna A vazia.
-    """
-    if all(v is None for v in row_values):
-        return False
-    val_a = row_values[0] if row_values else None
-    return val_a is not None and str(val_a).strip() != ""
+def _extract_rows(ws, header_row: int, col_index: dict[str, int]) -> list[dict]:
+    """Extrai linhas de dados do roteiro como lista de dicts."""
+    rows = []
+    for row_num in range(header_row + 1, ws.max_row + 1):
+        row_vals = {}
+        for field_name, col in col_index.items():
+            row_vals[field_name] = ws.cell(row=row_num, column=col).value
 
-
-def _extract_roteiro_rows(wb, header_row: int) -> list:
-    """
-    Retorna lista de (numero_real_linha_xlsx, dict_row).
-
-    Preserva o número real da linha no xlsx para que o ResultWriter
-    escreva nas células corretas mesmo com linhas não contíguas
-    (ex: testes em linhas 8,9,19,21,22... com gaps de agrupamento).
-    """
-    ws = wb.active
-    col_map = _resolve_merged_headers(ws, header_row)
-    max_col = ws.max_column or 0
-    headers = [col_map.get(i, f"col_{i}") for i in range(1, max_col + 1)]
-
-    rows: list[tuple[int, dict]] = []
-
-    for row_cells in ws.iter_rows(min_row=header_row + 1):
-        values       = tuple(cell.value for cell in row_cells)
-        real_row_num = row_cells[0].row
-
-        if not _is_test_row(values):
-            logger.debug("Linha %d ignorada (vazia ou agrupamento)", real_row_num)
+        # Pula linhas completamente vazias
+        if all(v is None for v in row_vals.values()):
             continue
 
-        row_dict = dict(zip(headers, values))
-        rows.append((real_row_num, row_dict))
+        # Extrai EANs do campo itens (formato: "N x EAN + ...")
+        import re
+        itens_str = str(row_vals.get("itens", "") or "")
+        row_vals["eans"] = re.findall(r"\b(\d{8,13})\b", itens_str)
 
-    if rows:
-        logger.info(
-            "Linhas de teste: %d | Primeira=linha %d | Última=linha %d",
-            len(rows), rows[0][0], rows[-1][0]
-        )
-        logger.info("Amostra de headers: %s", list(rows[0][1].keys())[:10])
-
+        row_vals["_row_num"] = row_num
+        rows.append(row_vals)
     return rows
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def main() -> int:
     args = parse_args()
-    logger.info("=== Scanntech QA Validator — início ===")
+    logger.info("=== Scanntech QA Validator v2 — inicio ===")
 
-    # --- 1. Carregamento ---
+    # ── 1. Carregamento ──────────────────────────────────────────────
     loader = FileLoader(
         roteiro_path=args.roteiro,
         audit_path=args.audit,
@@ -201,50 +127,57 @@ def main() -> int:
     try:
         artefatos = loader.load_all()
     except FileNotFoundError as e:
-        logger.error("Artefato não encontrado: %s", e)
+        logger.error("Artefato nao encontrado: %s", e)
         return 1
 
-    wb        = artefatos["workbook"]
-    audit_df  = artefatos["audit_df"]
+    wb       = artefatos["workbook"]
+    audit_df = artefatos["audit_df"]
     pdf_pages = artefatos["pdf_pages"]
 
-    # --- 2. Detecção do cabeçalho ---
-    header_row = _detect_header(wb, forced=args.header_row)
-    logger.info("Cabeçalho na linha %d", header_row)
-
-    # --- 3. Parsing ---
-    audit_parser = AuditParser(audit_df)
+    # ── 2. Parsing ───────────────────────────────────────────────────
+    audit_parser = AuditParser(audit_df)      # BUG-05: auto-detecta modo
     pdf_parser   = CouponPDFParser(pdf_pages)
     promo_engine = PromoEngine()
 
-    # --- 4. Runner + Writer + Logger ---
-    runner  = TestRunner(audit_parser, pdf_parser, promo_engine)
-    writer  = ResultWriter(wb, args.output)
+    # ── 3. Writer + Runner + Logger ──────────────────────────────────
+    writer  = ResultWriter(wb, args.output)   # BUG-02/04: header e 9 colunas
+    runner  = TestRunner(audit_parser, pdf_parser, promo_engine)  # BUG-01/03
     alogger = AuditLogger(args.log)
 
-    rows  = _extract_roteiro_rows(wb, header_row)
-    total = len(rows)
-    logger.info("Roteiro: %d testes encontrados", total)
+    ws = wb.active
+    header_row = writer.header_row  # reutiliza o detectado pelo ResultWriter
+    col_index  = _build_col_index(ws, header_row)
 
-    for idx, (real_row_num, row_dict) in enumerate(rows, start=1):
-        result = runner.run(row_dict, linha=real_row_num)
-        writer.write_result(result, real_row_num)
+    logger.info("Mapeamento de colunas: %s", col_index)
+
+    rows = _extract_rows(ws, header_row, col_index)
+    total = len(rows)
+    logger.info("Roteiro: %d linhas de teste encontradas", total)
+
+    for idx, row in enumerate(rows, start=1):
+        data_row = row["_row_num"]
+
+        # BUG-03: limpa resultados anteriores antes de reprocessar
+        writer.clear_result_row(data_row)
+
+        result = runner.run(row, linha=data_row)
+        writer.write_result(result, data_row)
         alogger.record(result)
 
-        status_label = "✓" if result.passed else "✗"
+        label = "OK" if result.passed else "ERRO"
         logger.info(
-            "[%d/%d] Linha xlsx=%-3d %s  %s",
-            idx, total, real_row_num, status_label,
+            "[%d/%d] Linha %-3d %-4s %s",
+            idx, total, data_row, label,
             f"({result.motivo_erro})" if not result.passed else ""
         )
 
-    # --- 5. Persistência ---
+    # ── 4. Persistencia ──────────────────────────────────────────────
     writer.save()
     alogger.flush()
 
     sumario = alogger.summary()
     logger.info(
-        "=== Concluído: %d/%d passaram (%.1f%%) ===",
+        "=== Concluido: %d/%d passaram (%.1f%%) ===",
         sumario["passou"], sumario["total"], sumario["pct_ok"]
     )
     return 0
