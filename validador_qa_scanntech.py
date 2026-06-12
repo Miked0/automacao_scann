@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-validador_qa_scanntech.py  (v2 — orquestrador corrigido)
+validador_qa_scanntech.py  (v3 — orquestrador corrigido)
 
 Correcoes aplicadas:
   BUG-01/03: extrai numero_sat, numero_ecf, numero_nfce separadamente do header
   BUG-02/04: usa detect_header_row robusto e preenche 9 colunas de resultado
-  BUG-05:    AuditParser detecta automaticamente modo JSON ou tabular
+  BUG-05:    ProcessadorAuditoria detecta automaticamente modo JSON ou tabular
+  BUG-06:    Imports corrigidos para nomes reais dos modulos em src/
+  BUG-07:    Chaves de artefatos e campos de resultado alinhados com modelos.py
 
 Uso:
     python validador_qa_scanntech.py \\
@@ -18,18 +20,19 @@ Uso:
 
 import argparse
 import logging
+import re
 import sys
 from pathlib import Path
 
-from src.file_loader              import FileLoader
-from src.processador_auditoria    import AuditParser
-from src.coupon_pdf_parser        import CouponPDFParser
-from src.promo_engine             import PromoEngine
-from src.test_runner              import TestRunner
-from src.result_writer            import ResultWriter, detect_header_row
-from src.registrador_auditoria    import AuditLogger
+from src.carregador_arquivos   import CarregadorArquivos
+from src.processador_auditoria import ProcessadorAuditoria
+from src.extrator_cupom_pdf    import CouponPDFParser
+from src.motor_promocoes       import MotorPromocoes
+from src.executor_testes       import ExecutorTestes
+from src.gravador_resultados   import GravadorResultados
+from src.registrador_auditoria import RegistradorAuditoria
 
-# ── Logging: arquivo + console ──────────────────────────────────────
+# ── Logging: arquivo + console ───────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -42,7 +45,7 @@ logger = logging.getLogger("qa_validator")
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Scanntech QA Validator v2")
+    p = argparse.ArgumentParser(description="Scanntech QA Validator v3")
     p.add_argument("--roteiro",  required=True, help="TEMPLATE xlsx (original, sem preenchimento)")
     p.add_argument("--audit",    required=True, help="Export Audit xlsx")
     p.add_argument("--pdf",      required=True, help="PDF de cupons fiscais")
@@ -52,9 +55,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-# ── Mapeamento de colunas do roteiro ─────────────────────────────────
-
-# Chaves de busca para cada coluna do TEMPLATE (case-insensitive)
+# ── Mapeamento de colunas do roteiro ───────────────────────────────────
 _COL_MAP = {
     "teste":          ["teste"],
     "tipo_promo":     ["tipo promo", "tipopromo", "tipo_promo", "promo"],
@@ -82,32 +83,26 @@ def _build_col_index(ws, header_row: int) -> dict[str, int]:
         val = str(cell.value).lower().strip()
         for field_name, keywords in _COL_MAP.items():
             if field_name not in index and any(kw in val for kw in keywords):
-                # Evita que 'total' sobrescreva 'subtotal'
                 if field_name == "total" and "sub" in val:
                     continue
-                # Evita que 'observacao' do input (C5) seja confundido com output (C21)
-                # O input está antes das colunas de número; o output depois.
                 index[field_name] = cell.column
     return index
 
 
 def _extract_rows(ws, header_row: int, col_index: dict[str, int]) -> list[dict]:
     """Extrai linhas de dados do roteiro como lista de dicts."""
+    # BUG-08 fix: re importado no topo do arquivo, nao dentro do loop
     rows = []
     for row_num in range(header_row + 1, ws.max_row + 1):
         row_vals = {}
         for field_name, col in col_index.items():
             row_vals[field_name] = ws.cell(row=row_num, column=col).value
 
-        # Pula linhas completamente vazias
         if all(v is None for v in row_vals.values()):
             continue
 
-        # Extrai EANs do campo itens (formato: "N x EAN + ...")
-        import re
         itens_str = str(row_vals.get("itens", "") or "")
         row_vals["eans"] = re.findall(r"\b(\d{8,13})\b", itens_str)
-
         row_vals["_row_num"] = row_num
         rows.append(row_vals)
     return rows
@@ -115,70 +110,71 @@ def _extract_rows(ws, header_row: int, col_index: dict[str, int]) -> list[dict]:
 
 def main() -> int:
     args = parse_args()
-    logger.info("=== Scanntech QA Validator v2 — inicio ===")
+    logger.info("=== Scanntech QA Validator v3 — inicio ===")
 
-    # ── 1. Carregamento ──────────────────────────────────────────────
-    loader = FileLoader(
+    # ── 1. Carregamento ────────────────────────────────────────────────
+    loader = CarregadorArquivos(
         roteiro_path=args.roteiro,
         audit_path=args.audit,
         pdf_path=args.pdf,
         json_dir=args.json_dir,
     )
     try:
-        artefatos = loader.load_all()
+        artefatos = loader.carregar_tudo()
     except FileNotFoundError as e:
         logger.error("Artefato nao encontrado: %s", e)
         return 1
 
-    wb       = artefatos["workbook"]
-    audit_df = artefatos["audit_df"]
-    pdf_pages = artefatos["pdf_pages"]
+    # BUG-07 fix: chave correta 'pdf_paginas' (nao 'pdf_pages')
+    wb          = artefatos["workbook"]
+    audit_df    = artefatos["audit_df"]
+    pdf_paginas = artefatos["pdf_paginas"]
 
-    # ── 2. Parsing ───────────────────────────────────────────────────
-    audit_parser = AuditParser(audit_df)      # BUG-05: auto-detecta modo
-    pdf_parser   = CouponPDFParser(pdf_pages)
-    promo_engine = PromoEngine()
+    # ── 2. Parsing ──────────────────────────────────────────────────────
+    audit_parser = ProcessadorAuditoria(audit_df)
+    pdf_parser   = CouponPDFParser(pdf_paginas)
+    motor_promos = MotorPromocoes()
 
-    # ── 3. Writer + Runner + Logger ──────────────────────────────────
-    writer  = ResultWriter(wb, args.output)   # BUG-02/04: header e 9 colunas
-    runner  = TestRunner(audit_parser, pdf_parser, promo_engine)  # BUG-01/03
-    alogger = AuditLogger(args.log)
+    # ── 3. Writer + Runner + Logger ───────────────────────────────────────
+    writer   = GravadorResultados(wb, args.output)
+    executor = ExecutorTestes(audit_parser, pdf_parser, motor_promos)
+    alogger  = RegistradorAuditoria(args.log)
 
-    ws = wb.active
-    header_row = writer.header_row  # reutiliza o detectado pelo ResultWriter
+    ws         = wb.active
+    header_row = writer.header_row
     col_index  = _build_col_index(ws, header_row)
 
     logger.info("Mapeamento de colunas: %s", col_index)
 
-    rows = _extract_rows(ws, header_row, col_index)
+    rows  = _extract_rows(ws, header_row, col_index)
     total = len(rows)
     logger.info("Roteiro: %d linhas de teste encontradas", total)
 
     for idx, row in enumerate(rows, start=1):
         data_row = row["_row_num"]
 
-        # BUG-03: limpa resultados anteriores antes de reprocessar
         writer.clear_result_row(data_row)
 
-        result = runner.run(row, linha=data_row)
-        writer.write_result(result, data_row)
-        alogger.record(result)
+        resultado = executor.executar(row, linha=data_row)
+        writer.write_result(resultado, data_row)
+        alogger.registrar(resultado)
 
-        label = "OK" if result.passed else "ERRO"
+        # BUG-07 fix: campo 'aprovado' e 'motivo_reprovacao' (nao 'passed'/'motivo_erro')
+        label = "OK" if resultado.aprovado else "ERRO"
         logger.info(
             "[%d/%d] Linha %-3d %-4s %s",
             idx, total, data_row, label,
-            f"({result.motivo_erro})" if not result.passed else ""
+            f"({resultado.motivo_reprovacao})" if not resultado.aprovado else ""
         )
 
-    # ── 4. Persistencia ──────────────────────────────────────────────
+    # ── 4. Persistência ──────────────────────────────────────────────────
     writer.save()
-    alogger.flush()
+    alogger.finalizar()
 
-    sumario = alogger.summary()
+    sumario = alogger.sumario()
     logger.info(
-        "=== Concluido: %d/%d passaram (%.1f%%) ===",
-        sumario["passou"], sumario["total"], sumario["pct_ok"]
+        "=== Concluido: %d/%d aprovados (%.1f%%) ===",
+        sumario["aprovados"], sumario["total"], sumario["pct_ok"]
     )
     return 0
 
